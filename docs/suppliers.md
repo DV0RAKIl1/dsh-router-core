@@ -378,9 +378,41 @@ export function dispose() {}
 
 单个供应商加载失败(缺 `id`/`name`、构造异常)不阻断其他供应商,错误记入 DSH 日志。
 
-**模型统一策略**:模型列表**优先从上游拉取**,缓存由核心统一管
-(`Router.modelsOf`,TTL 10 分钟),js **不要自己缓存**——自己缓存一份会和核心
-那份一起过期两次,「获取模型」按钮就成了摆设。
+### 显式多供应商 bundle
+
+用户目录通常每个 `*.js` 文件导出一个供应商。需要把许多相似供应商集中在一个适配器时,可导出带明确标记的 bundle；loader 不会把普通对象误判为 bundle：
+
+```js
+export default {
+  kind: 'dsh-supplier-bundle',
+  providers: [
+    { id: 'alpha', create: (env) => createAlpha(env) },
+    { id: 'beta', create: (env) => createBeta(env) },
+  ],
+}
+```
+
+每项必须有唯一、非空 `id` 和 `create(env)` 工厂,工厂返回的模块 `id` 必须与条目一致。bundle 为空、结构非法或 id 重复会使该文件加载失败；单项工厂抛错或返回无效模块时只记录该项错误,其余项仍会加载。每项都会获得独立的 `env` 浅拷贝及独立账号池,`store`、`credentials` 等服务仍由核心共享。供应商模块仍遵守上面的常规接口；`wire` 与 `responsesOnce` 等可选能力也按单项生效。
+
+配置驱动的供应商可把 `providers.js` 与相邻 JSON 配置放在用户目录,由 JS 工厂按 provider id 生成常规模块。ESM 适配器可用 Node 内置 `createRequire(import.meta.url)` 读取同目录 JSON,不需新增依赖。迁移时先逐项比对模型策略、探测状态、超时、请求头、错误映射和自定义端点，再把旧脚本移出扫描目录；扫描器只加载顶层 `*.js`,且同 id 仍按文件名字典序后者覆盖前者。原始脚本应在迁移归档中保留,以便回滚和行为对照。
+
+原生 Responses 是按模块能力(`responsesOnce`)选择,不依据模型名称猜测。供应商可针对 Responses 使用独立上游 URL,并在该方法中保持请求体、流式取消及失败状态映射。DSH 内部 `RouterAdapter` 现在直接请求本插件 `/v1/responses`,核心路由再原样调用供应商的 `responsesOnce`;这条主链路不经过 Chat→Responses 转换。外部仍主动请求 `/v1/chat/completions` 时,才使用供应商的 Chat 兼容实现；核心自带的 OpenRouter、NVIDIA、OpenCode 供应商仍由各自内置模块提供,不应并入用户 bundle。
+
+### 配置驱动适配器示例
+
+本机 Web profile 的 15 个自定义供应商由 `~/.dsh/profiles/web/suppliers/providers.js` 加载,规格位于相邻的 `providers.json`。每条配置保留供应商 id、名称、优先级、base URL、key hint、探测模型和 fallback 列表,并按需声明：
+
+- 模型响应形状(`modelPayload`)、HTTP/异常/空列表时供应商自身的兼容 fallback 策略(`modelsHttpFailure`、`modelsExceptionFailure`、`emptyModels`)；这层仅用于保留旧适配器面对上游故障时的返回行为,不取代核心的 TTL 与 stale-while-revalidate 缓存。
+- 探测成功状态与错误映射(`probe*`)、探测/正式请求头(`probeHeaders`、`headers`)
+- 模型过滤/去重/上下文归一化(`modelFilter`、`dedupeModels`、`modelNormalize`)与正式请求超时类型(`chatTimeout`)
+- 原生 Responses URL(`responsesUrl`)与可选的外部 Chat→Responses 兼容桥(`chatBridge`);当前 Web profile 仅 AllTokens 保留 `chatBridge: "responses"`,其余供应商的外部 Chat 请求仍走各自 `/chat/completions`
+
+当前有意保留的供应商差异包括：SSDY 接受原始数组或 `.data` 模型列表；RRX、YJ、AMD、DeepSeek、JBB 将 HTTP 失败使用 fallback、异常交给缓存/fallback、有效空数组照常返回；Codex666 过滤非 Chat 模型、去重并把 context token 数除以 1000 后封顶 250；OpenCode 使用不同的正式请求与探测请求头且失败时只返回缓存/空列表；RRX/YJ 使用总请求超时，其他供应商的 Chat 请求只对响应头设 120 秒预算；DeepSeek Responses 使用不同于其 `/v1` base 的显式 `/responses` endpoint；DSH 内部请求统一走本地 `/v1/responses` 后直连各供应商 Responses，只有 AllTokens 的外部 Chat 兼容入口把 Chat 映射为 Responses 并将 SSE 转回 Chat。配置变化应通过离线 mock 测试覆盖请求 URL、头、模型与错误策略,禁止将真实凭证写入测试或文档。
+
+**模型统一策略**:模型列表**优先从上游拉取**,常规 TTL 缓存由核心统一管
+(`Router.modelsOf`,TTL 10 分钟),js 不应再添加独立 TTL 缓存,否则过期策略会叠加。
+只有为兼容既有供应商在上游 HTTP/解析失败时使用旧模型或 fallback 的行为,才可保留
+有限的进程内最近成功列表；这不是第二层 TTL,也不改变核心缓存生命周期。
 
 核心缓存是 **stale-while-revalidate**:过期后**先返回旧值**让面板立刻有内容,
 后台再重新拉。所以 `listModels` 被调用的时机是:

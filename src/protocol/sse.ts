@@ -26,17 +26,18 @@ export interface SseFrame {
  */
 export class SseSplitter {
   private buf = ''
+  private readonly decoder = new TextDecoder()
 
   /** 喂入一块字节，返回其中包含的完整帧（可能 0..n 个）。 */
   push(bytes: Uint8Array): SseFrame[] {
-    this.buf += new TextDecoder().decode(bytes, { stream: true })
+    this.buf += this.decoder.decode(bytes, { stream: true })
     return this.drain()
   }
 
   /** 流结束时冲刷：把残留的、不以空行结尾的尾帧也吐出来（上游不发尾空行是有的）。 */
   end(): SseFrame[] {
     // 收掉 decoder 里可能残留的替换序列
-    this.buf += new TextDecoder().decode()
+    this.buf += this.decoder.decode()
     const out = this.drain()
     if (this.buf.trim() !== '') {
       const frame = parseFrame(this.buf)
@@ -56,10 +57,27 @@ export class SseSplitter {
       const match = /\r?\n\r?\n/.exec(this.buf)
       const raw = this.buf.slice(0, sep)
       this.buf = this.buf.slice(sep + (match?.[0].length ?? 2))
-      if (raw.trim() !== '') out.push(parseFrame(raw))
+      if (raw.trim() !== '') out.push(...parseRawFrames(raw))
     }
     return out
   }
+}
+
+/**
+ * 少数 SSE 中间件只用单个换行推进 event/data，却仍然发送多个事件。
+ * 标准多行 data 必须合并，所以只有看到多个 `event:` 行时才启用这个窄容错。
+ */
+function parseRawFrames(raw: string): SseFrame[] {
+  const lines = raw.split(/\r?\n/)
+  const starts = lines.flatMap((line, index) => line.startsWith('event:') ? [index] : [])
+  if (starts.length < 2) return [parseFrame(raw)]
+  const frames: SseFrame[] = []
+  for (let i = 0; i < starts.length; i += 1) {
+    const end = starts[i + 1] ?? lines.length
+    const chunk = lines.slice(starts[i], end).join('\n').trim()
+    if (chunk !== '') frames.push(parseFrame(chunk))
+  }
+  return frames
 }
 
 /** 把一帧原文拆成 `event` + `data`。空 data 的帧（注释/keep-alive）返回空 data。 */

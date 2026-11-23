@@ -3,7 +3,7 @@
  * 每个供应商提供 OpenAI 兼容的 chat/models，并暴露面板状态。
  * 仿 9router：供应商 = 一种"免费/付费"通道；dsh-router 在其上做路由。
  */
-import type { AccountState, ChatOnceResult, SupplierAccountNow } from '../suppliers/contract.ts'
+import type { AccountState, ChatOnceResult, ResponsesOnceResult, SupplierAccountNow } from '../suppliers/contract.ts'
 import type { AccountPool } from './account-pool.ts'
 import type { ProtocolId } from '../protocol/types.ts'
 
@@ -65,6 +65,17 @@ export interface Combo {
   models: string[]
 }
 
+/** Native /v1/responses request metadata with its original JSON body. */
+export interface ResponsesRequest {
+  rawBody: string
+  stream: boolean
+  model: string
+  lv?: string
+  session?: string
+  /** Aborted when the client disconnects or the native first-byte budget expires. */
+  signal?: AbortSignal
+}
+
 /** 一次 /v1/chat/completions 请求。 */
 export interface ChatRequest {
   /** 原始请求体 JSON 字符串。 */
@@ -83,6 +94,8 @@ export interface ChatRequest {
    * 能反查是哪个客户端在打）。缺省 = 匿名外部客户端。
    */
   session?: string
+  /** Optional cancellation signal for non-Chat ingress adapted through Chat suppliers. */
+  signal?: AbortSignal
   /**
    * 客户端说的协议（入站）。
    *
@@ -119,6 +132,8 @@ export interface Supplier {
   accounts(): SupplierAccountNow[]
   /** 对单个账号调一次上游。不遍历账号、不管冷却、不写 res。 */
   chatOnce(uid: string, lv: string, req: ChatRequest): Promise<ChatOnceResult>
+  /** Native Responses route; absent suppliers use the strict Chat compatibility path. */
+  responsesOnce?(uid: string, lv: string, req: ResponsesRequest): Promise<ResponsesOnceResult>
   /**
    * 上游说哪种协议（缺省 `'chat'`）。
    *

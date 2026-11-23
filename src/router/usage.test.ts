@@ -87,6 +87,16 @@ test('合并：一侧为 null 时取另一侧', () => {
   assert.equal(mergeUsage(null, null), null)
 })
 
+test('Responses JSON 与 CRLF SSE 从 response.usage 提取用量', () => {
+  assert.deepEqual(usageFromJsonBody(JSON.stringify({ response: { usage: { input_tokens: 11, output_tokens: 4, input_tokens_details: { cached_tokens: 3 } } } })), {
+    promptTokens: 11, completionTokens: 4, cachedTokens: 3,
+  })
+  const expected = { promptTokens: 11, completionTokens: 4, cachedTokens: 0 }
+  assert.deepEqual(usageFromJsonBody('event: response.completed\r\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":11,"output_tokens":4}}}\r\n\r\n'), expected)
+  const cr = String.fromCharCode(13)
+  assert.deepEqual(usageFromJsonBody(['event: response.completed', 'data: {"type":"response.completed","response":{"usage":{"input_tokens":11,"output_tokens":4}}}', '', ''].join(cr)), expected)
+})
+
 test('帧提取：OpenAI 最后一帧的 usage + Responses API 的 response.usage', () => {
   assert.deepEqual(extractFrameUsage({ usage: { prompt_tokens: 9, completion_tokens: 1 } }), {
     promptTokens: 9, completionTokens: 1, cachedTokens: 0,
@@ -180,6 +190,18 @@ test('tapStreamUsage：原样透传每个字节，统计在旁路做', async () 
   assert.deepEqual(got.usage, { promptTokens: 10, completionTokens: 5, cachedTokens: 0 })
   assert.equal(got.outputChars, 5) // "he" + "llo"
   assert.ok(got.ttfbMs >= 0)
+})
+
+test('tapStreamUsage：Responses CR-only 帧分隔符统计 usage 并原样透传', async () => {
+  const cr = String.fromCharCode(13)
+  const firstFrame = `event: response.output_text.delta${cr}data: {"type":"response.output_text.delta","delta":"hello"}${cr}${cr}`
+  const secondFrame = `event: response.completed${cr}data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":2}}}${cr}${cr}`
+  const chunks = [firstFrame.slice(0, firstFrame.indexOf(cr) + 1), firstFrame.slice(firstFrame.indexOf(cr) + 1) + secondFrame]
+  const { stream, done } = tapStreamUsage(sseStream(chunks), Date.now(), { propagateErrors: true })
+  assert.equal(await drain(stream), chunks.join(''))
+  const got = await done()
+  assert.deepEqual(got.usage, { promptTokens: 10, completionTokens: 2, cachedTokens: 0 })
+  assert.equal(got.outputChars, 5)
 })
 
 test('tapStreamUsage：帧被切在 chunk 边界上也能拼回来', async () => {

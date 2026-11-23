@@ -16,10 +16,10 @@ import { readdirSync } from 'node:fs'
 import { join, dirname, basename } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type { ServerResponse } from 'node:http'
-import type { ChatRequest, ModelInfo, ModelWithEnabled, Supplier, SupplierStatus } from '../router/types.ts'
+import type { ChatRequest, ModelInfo, ModelWithEnabled, ResponsesRequest, Supplier, SupplierStatus } from '../router/types.ts'
 import type { SupplierConfigStore } from '../supplier-config.ts'
 import type { CredentialStore } from '../credential-store.ts'
-import type { ChatOnceResult, SupplierAccountNow, SupplierEnv, SupplierFactory, SupplierModule } from './contract.ts'
+import type { ChatOnceResult, ResponsesOnceResult, SupplierAccountNow, SupplierBundle, SupplierEnv, SupplierFactory, SupplierModule } from './contract.ts'
 import { AccountPool } from '../router/account-pool.ts'
 
 /** 供应商加载错误（不阻断其他供应商）。 */
@@ -60,19 +60,43 @@ function hydrateCredits(supplierId: string, store: SupplierConfigStore, accounts
   })
 }
 
-/** 从模块导出解析出供应商模块对象（支持 export default / 命名导出 / factory）。 */
-function resolveModule(mod: Record<string, unknown>, file: string): SupplierModule {
-  const cand = (mod.default ?? mod) as Record<string, unknown>
-  // factory 形式：模块 default 是 (env) => SupplierModule，跳过静态检查，loadOne 调用后实例生效
-  if (typeof cand === 'function') return cand as unknown as SupplierModule
-  if (typeof cand !== 'object' || cand === null) throw new Error(`供应商模块无效: ${file}`)
-  if (typeof cand.id !== 'string' || cand.id === '') throw new Error(`供应商缺少 id: ${file}`)
-  if (typeof cand.name !== 'string' || cand.name === '') throw new Error(`供应商缺少 name: ${file}`)
-  return cand as unknown as SupplierModule
+type ResolvedSupplierFile = SupplierModule | SupplierFactory | SupplierBundle
+
+function isSupplierBundle(value: unknown): value is SupplierBundle {
+  if (typeof value !== 'object' || value === null) return false
+  const bundle = value as Partial<SupplierBundle>
+  return bundle.kind === 'dsh-supplier-bundle' && Array.isArray(bundle.providers)
 }
 
-/** 加载单个供应商文件，返回模块对象或抛错。 */
-async function importSupplierFile(file: string): Promise<SupplierModule> {
+/** 从模块导出解析出供应商模块、工厂或显式标记的多供应商 bundle。 */
+function resolveModule(mod: Record<string, unknown>, file: string): ResolvedSupplierFile {
+  const cand = mod.default ?? mod
+  if (isSupplierBundle(cand)) {
+    if (cand.providers.length === 0) throw new Error(`供应商 bundle 为空: ${file}`)
+    const ids = new Set<string>()
+    for (const provider of cand.providers) {
+      if (!provider || typeof provider.id !== 'string' || provider.id === '' || typeof provider.create !== 'function') {
+        throw new Error(`供应商 bundle 条目无效: ${file}`)
+      }
+      if (ids.has(provider.id)) throw new Error(`供应商 bundle id 重复: ${provider.id}`)
+      ids.add(provider.id)
+    }
+    return cand
+  }
+  // factory 形式：模块 default 是 (env) => SupplierModule，实例在 loadOne 阶段创建。
+  if (typeof cand === 'function') return cand as SupplierFactory
+  if (typeof cand !== 'object' || cand === null) throw new Error(`供应商模块无效: ${file}`)
+  if (typeof (cand as Record<string, unknown>).id !== 'string' || (cand as Record<string, unknown>).id === '') {
+    throw new Error(`供应商缺少 id: ${file}`)
+  }
+  if (typeof (cand as Record<string, unknown>).name !== 'string' || (cand as Record<string, unknown>).name === '') {
+    throw new Error(`供应商缺少 name: ${file}`)
+  }
+  return cand as SupplierModule
+}
+
+/** 加载单个供应商文件，返回模块对象或显式标记的 bundle。 */
+async function importSupplierFile(file: string): Promise<ResolvedSupplierFile> {
   const url = pathToFileURL(file).href
   const mod = (await import(url)) as Record<string, unknown>
   return resolveModule(mod, file)
@@ -98,22 +122,41 @@ function ownEnv(env: SupplierEnv): SupplierEnv {
   return { ...env }
 }
 
-/** 从文件构造 LoadedSupplier。 */
-async function loadOne(file: string, env: SupplierEnv, source: 'builtin' | 'user'): Promise<LoadedSupplier> {
-  const mod = await importSupplierFile(file)
-  const mine = ownEnv(env)
-  // 支持 factory: 模块本身就是工厂函数
-  let instance: SupplierModule
-  if (typeof mod === 'function') {
-    instance = (mod as unknown as SupplierFactory)(mine)
-    if (typeof instance !== 'object' || instance === null || typeof instance.id !== 'string' || instance.id === '') {
-      throw new Error(`供应商 factory 返回无效: ${file}`)
-    }
-    // 测试模型由核心统一走 chatOnce 路径，插件无需实现 testModel
-  } else {
-    instance = mod
+function createSupplier(factory: SupplierFactory, env: SupplierEnv, file: string, expectedId?: string): SupplierModule {
+  const instance = factory(env)
+  if (typeof instance !== 'object' || instance === null || typeof instance.id !== 'string' || instance.id === '') {
+    throw new Error(`供应商 factory 返回无效${expectedId ? `: ${expectedId}` : ''} in ${file}`)
   }
-  return wrapModule(instance, mine, file, source)
+  if (expectedId && instance.id !== expectedId) {
+    throw new Error(`供应商 bundle id 不匹配: expected ${expectedId}, got ${instance.id} in ${file}`)
+  }
+  return instance
+}
+
+/** 从文件构造一个或多个 LoadedSupplier；bundle 成员各自拥有 env 和池。 */
+async function loadFile(file: string, env: SupplierEnv, source: 'builtin' | 'user'): Promise<{
+  loaded: LoadedSupplier[]
+  errors: SupplierLoadError[]
+}> {
+  const resolved = await importSupplierFile(file)
+  if (!isSupplierBundle(resolved)) {
+    const mine = ownEnv(env)
+    const instance = typeof resolved === 'function' ? createSupplier(resolved, mine, file) : resolved
+    return { loaded: [wrapModule(instance, mine, file, source)], errors: [] }
+  }
+
+  const loaded: LoadedSupplier[] = []
+  const errors: SupplierLoadError[] = []
+  for (const provider of resolved.providers) {
+    const mine = ownEnv(env)
+    try {
+      const instance = createSupplier(provider.create, mine, file, provider.id)
+      loaded.push(wrapModule(instance, mine, file, source))
+    } catch (error) {
+      errors.push({ id: provider.id, file, error: (error as Error).message })
+    }
+  }
+  return { loaded, errors }
 }
 
 /**
@@ -148,7 +191,8 @@ export function wrapModule(instance: SupplierModule, env: SupplierEnv, source: s
     id: instance.id,
     name: instance.name,
     priority: instance.priority ?? 0,
-    icon: (instance as { icon?: string }).icon,
+    wire: instance.wire,
+    icon: instance.icon,
     apiKeyHint: (instance as { apiKeyHint?: string }).apiKeyHint,
     status: (): SupplierStatus => {
       const now = instance.status()
@@ -178,6 +222,9 @@ export function wrapModule(instance: SupplierModule, env: SupplierEnv, source: s
     customModelIds: (): string[] => [...env.store.get(instance.id).custom],
     accounts: (): SupplierAccountNow[] => instance.status().accounts,
     chatOnce: (uid: string, lv: string, req: ChatRequest): Promise<ChatOnceResult> => instance.chatOnce(uid, lv, req),
+    ...(isFn(instance.responsesOnce) ? {
+      responsesOnce: (uid: string, lv: string, req: ResponsesRequest): Promise<ResponsesOnceResult> => instance.responsesOnce!(uid, lv, req),
+    } : {}),
     // 删除链接：数据删除是通用能力，凭证清理由供应商内部实现（js 契约不要求）
     removeLink: isFn((instance as unknown as Record<string, unknown>).removeLink)
       ? (uid: string): Promise<boolean> => (instance as unknown as { removeLink(uid: string): Promise<boolean> }).removeLink(uid)
@@ -243,9 +290,15 @@ export async function loadSuppliers(opts: LoadSuppliersOptions): Promise<{
 
   for (const f of scanDir(opts.userDir).sort()) {
     try {
-      const loaded = await loadOne(f, env, 'user')
-      byId.set(loaded.supplier.id, loaded)
-      opts.log(`supplier ${loaded.supplier.id} loaded (user) from ${basename(f)}`)
+      const result = await loadFile(f, env, 'user')
+      for (const error of result.errors) {
+        errors.push(error)
+        opts.log(`supplier load failed ${error.id} from ${basename(f)}: ${error.error}`)
+      }
+      for (const loaded of result.loaded) {
+        byId.set(loaded.supplier.id, loaded)
+        opts.log(`supplier ${loaded.supplier.id} loaded (user) from ${basename(f)}`)
+      }
     } catch (err) {
       errors.push({ id: basename(f, '.js'), file: f, error: (err as Error).message })
       opts.log(`supplier load failed ${basename(f)}: ${(err as Error).message}`)

@@ -28,7 +28,15 @@ async function serveSse(): Promise<{ port: number; hits: string[]; close: () => 
   const server = createServer((req, res) => {
     hits.push(req.url ?? '')
     res.writeHead(200, { 'content-type': 'text/event-stream' })
-    res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' } }] })}\n\ndata: [DONE]\n\n`)
+    res.end([
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","delta":"ok"}',
+      '',
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_test","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}}',
+      '',
+      '',
+    ].join('\n'))
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   const { port } = server.address() as AddressInfo
@@ -50,7 +58,7 @@ test('端点：宿主端口不是 3080 时，请求照样落得到（issue #9 �
     assert.notEqual(up.port, 3080, '这条用例的判据就是「端口不是 3080」')
     const adapter = new RouterAdapter(loopbackBaseURL(() => up.port), { comboModels: async () => [] })
     const types = await drain(adapter)
-    assert.deepEqual(up.hits, ['/v1/chat/completions'], `请求应打到宿主 /v1，实际打到：${JSON.stringify(up.hits)}`)
+    assert.deepEqual(up.hits, ['/v1/responses'], `请求应打到宿主 /v1，实际打到：${JSON.stringify(up.hits)}`)
     assert.ok(types.includes('text-delta'), `应真的收到上游内容，实际块类型：${JSON.stringify(types)}`)
   } finally {
     await up.close()
@@ -73,8 +81,8 @@ test('端点：端口每次请求现算（listen 前读不到、宿主重启换�
     await drain(adapter)
     port = second.port // 宿主换了端口（重启 / 重新 listen）
     await drain(adapter)
-    assert.deepEqual(first.hits, ['/v1/chat/completions'], '第一次应打在第一个端口')
-    assert.deepEqual(second.hits, ['/v1/chat/completions'], '端口变了之后应改打新端口（不能缓存第一次的值）')
+    assert.deepEqual(first.hits, ['/v1/responses'], '第一次应打在第一个端口')
+    assert.deepEqual(second.hits, ['/v1/responses'], '端口变了之后应改打新端口（不能缓存第一次的值）')
     assert.ok(reads >= 2, `端口应每请求现读，实际只读了 ${reads} 次`)
   } finally {
     await first.close()

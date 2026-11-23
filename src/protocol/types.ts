@@ -179,7 +179,7 @@ export interface ProtocolCodec {
    * 流开始时的一次性帧（Anthropic 的 `message_start`、Responses 的
    * `response.created`）。恒等协议返回空数组。
    */
-  startFrames(ctx: CodecContext): string[]
+  startFrames(ctx: CodecContext, session?: CodecSession): string[]
 
   /**
    * 流结束时的一次性帧（`message_stop`、`response.completed`、`[DONE]`）。

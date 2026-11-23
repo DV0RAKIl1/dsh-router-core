@@ -13,7 +13,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { AssistantStreamAccumulator, EMPTY_RESPONSE_CODE } from '@deepseek-ai/dsh-llm'
 import { toTokenUsage } from '../router/usage-tokens.ts'
-import { RouterAdapter, translateSse } from './adapter.ts'
+import { RouterAdapter, translateResponsesSse, translateSse, wireRequest, wireResponsesRequest } from './adapter.ts'
 
 /**
  * 本文件大量用例把 `globalThis.fetch` 打桩成假上游，且**从不还原**（沿既有惯例：
@@ -44,6 +44,24 @@ async function usageOf(...payloads: string[]): Promise<Record<string, unknown> |
 
 /** 一帧 SSE 的 data 载荷（translateSse 吃的是已剥掉 `data:` 前缀的载荷）。 */
 const frame = (obj: unknown): string => JSON.stringify(obj)
+
+/** Responses 文本增量 + response.completed 的最小事件流。 */
+function responsesTextSse(text = 'ok', terminal = true, newline = '\n'): string {
+  const lines = [
+    'event: response.output_text.delta',
+    `data: ${JSON.stringify({ type: 'response.output_text.delta', delta: text })}`,
+    '',
+  ]
+  if (terminal) {
+    lines.push(
+      'event: response.completed',
+      `data: ${JSON.stringify({ type: 'response.completed', response: { id: 'resp_test', status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text }] }] } })}`,
+      '',
+    )
+  }
+  lines.push('')
+  return lines.join(newline)
+}
 
 /* ---------------- 契约转换 ---------------- */
 
@@ -389,12 +407,12 @@ function slowBody(): { stream: ReadableStream<Uint8Array>; resume: () => void; s
   const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
       if (!sent) {
-        controller.enqueue(enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: 'first' } }] })}\n\n`))
+        controller.enqueue(enc.encode(responsesTextSse('first', false)))
         sent = true
         return
       }
       await gate
-      controller.enqueue(enc.encode('data: [DONE]\n\n'))
+      controller.enqueue(enc.encode(responsesTextSse('', true)))
       controller.close()
     },
   })
@@ -424,7 +442,7 @@ test('流式：上游还没发完，下游必须已经拿到前面的块（不�
 test('流式：断流（无 [DONE]）抛的 code 必须在可重试白名单里', async () => {
   // 同上一条白名单约束的另一处踩坑点：断流是**最该重试**的故障（半截响应、
   // 连接被切），若用自造码（STREAM_CLOSED）不在白名单里就永不重试。
-  const sse = `data: ${JSON.stringify({ choices: [{ delta: { content: 'a' } }] })}\n\n`
+  const sse = responsesTextSse('a', false)
   globalThis.fetch = (async () => new Response(new TextEncoder().encode(sse), { status: 200 })) as typeof fetch
   const adapter = new RouterAdapter('http://x', { comboModels: async () => [] })
   let code = ''
@@ -437,7 +455,7 @@ test('流式：断流（无 [DONE]）抛的 code 必须在可重试白名单里'
 })
 
 test('流式：CRLF 换行也能正确收尾（不能把 \\r 当成帧内容）', async () => {
-  const sse = `data: ${JSON.stringify({ choices: [{ delta: { content: 'a' } }] })}\r\n\r\ndata: [DONE]\r\n\r\n`
+  const sse = responsesTextSse('a', true, '\r\n')
   globalThis.fetch = (async () => new Response(new TextEncoder().encode(sse), { status: 200 })) as typeof fetch
   const adapter = new RouterAdapter('http://x', { comboModels: async () => [] })
   const types: string[] = []
@@ -449,8 +467,10 @@ test('流式：CRLF 换行也能正确收尾（不能把 \\r 当成帧内容）'
 
 test('流式：一帧横跨两次 read() 也能拼回来（半包）', async () => {
   const enc = new TextEncoder()
-  const half = 'data: {"choices":[{"delta":{"content":"hel'
-  const rest = 'lo"}}]}\n\ndata: [DONE]\n\n'
+  const full = responsesTextSse('hello')
+  const splitAt = full.indexOf('hello') + 2
+  const half = full.slice(0, splitAt)
+  const rest = full.slice(splitAt)
   let sent = false
   globalThis.fetch = (async () =>
     new Response(
@@ -470,7 +490,64 @@ test('流式：一帧横跨两次 read() 也能拼回来（半包）', async () 
   assert.equal(texts.join(''), 'hello', '跨块的半帧必须拼成完整内容')
 })
 
-/* ---------------- wire 请求构造（对照 9router 查出的缺陷） ---------------- */
+
+test('Responses SSE：直接解码文本/推理/usage/finish，不经过 Chat SSE', async () => {
+  const frames = [
+    { event: 'response.output_text.delta', data: JSON.stringify({ type: 'response.output_text.delta', delta: 'hello' }) },
+    { event: 'response.reasoning_summary_text.delta', data: JSON.stringify({ type: 'response.reasoning_summary_text.delta', delta: 'think' }) },
+    { event: 'response.completed', data: JSON.stringify({
+      type: 'response.completed',
+      response: {
+        id: 'resp_1', status: 'completed',
+        usage: { input_tokens: 10, output_tokens: 4, input_tokens_details: { cached_tokens: 2 } },
+        output: [{ type: 'message', content: [{ type: 'output_text', text: 'hello' }] }],
+      },
+    }) },
+  ]
+  const chunks: Array<Record<string, unknown>> = []
+  for await (const chunk of translateResponsesSse(frames)) chunks.push(chunk as unknown as Record<string, unknown>)
+  assert.deepEqual(chunks.filter((c) => c.type === 'text-delta').map((c) => c.text), ['hello'])
+  assert.deepEqual(chunks.filter((c) => c.type === 'reasoning-delta').map((c) => c.text), ['think'])
+  assert.deepEqual(chunks.find((c) => c.type === 'usage')?.usage, { inputTokens: 8, outputTokens: 4, cacheReadTokens: 2 })
+  assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'stop' } })
+})
+
+test('Responses SSE：工具调用按 output_index 保持稳定，并在 completed 后闭合', async () => {
+  const frames = [
+    { event: 'response.output_item.added', data: JSON.stringify({
+      type: 'response.output_item.added', output_index: 0,
+      item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'bash' },
+    }) },
+    { event: 'response.function_call_arguments.delta', data: JSON.stringify({
+      type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"command":"ls"}',
+    }) },
+    { event: 'response.completed', data: JSON.stringify({
+      type: 'response.completed', response: {
+        status: 'completed', output: [{ type: 'function_call', call_id: 'call_1', name: 'bash', arguments: '{"command":"ls"}' }],
+      },
+    }) },
+  ]
+  const chunks: Array<Record<string, unknown>> = []
+  for await (const chunk of translateResponsesSse(frames)) chunks.push(chunk as unknown as Record<string, unknown>)
+  assert.ok(chunks.some((c) => c.type === 'tool-call-delta' && c.id === 'call_1' && c.name === 'bash'))
+  assert.deepEqual(chunks.find((c) => c.type === 'block-end')?.block, {
+    type: 'tool-call', id: 'call_1', name: 'bash', arguments: '{"command":"ls"}',
+  })
+  assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'tool-calls' } })
+})
+
+test('Responses SSE：上游 failed 事件映射成可重试的 error finish', async () => {
+  const frames = [{
+    event: 'response.failed',
+    data: JSON.stringify({ type: 'response.failed', response: { status: 'failed', error: { message: 'upstream failed' } } }),
+  }]
+  const chunks: Array<Record<string, unknown>> = []
+  for await (const chunk of translateResponsesSse(frames)) chunks.push(chunk as unknown as Record<string, unknown>)
+  assert.deepEqual(chunks.at(-1), {
+    type: 'finish', reason: { kind: 'error', failure: { message: 'upstream failed', code: 'SERVER' } },
+  })
+})
+
 
 /**
  * 为什么要有这一组：dsh-router 是「从结构化 options 重建 wire body」，
@@ -478,18 +555,19 @@ test('流式：一帧横跨两次 read() 也能拼回来（半包）', async () 
  * 悄悄降级，所以必须逐条锁死。这几条都是对照 9router 查出来的。
  */
 
-/** 拦下 stream() 发给上游的 body，返回解析后的对象。 */
+/** 直接构造兼容 Chat body；RouterAdapter 的运行时路径现在是 Responses。 */
 async function captureBody(options: Record<string, unknown>): Promise<Record<string, unknown>> {
-  let captured: Record<string, unknown> = {}
-  globalThis.fetch = (async (_url: string, init?: { body?: string }) => {
-    captured = JSON.parse(init?.body ?? '{}') as Record<string, unknown>
-    return new Response('data: [DONE]\n\n', { status: 200 })
-  }) as typeof fetch
-  const adapter = new RouterAdapter('http://x', { comboModels: async () => [] })
-  for await (const _c of adapter.stream({ model: 'm', messages: [], signal: AbortSignal.timeout(3000), ...options } as never)) {
-    void _c
-  }
-  return captured
+  return wireRequest({ model: 'm', messages: [], signal: AbortSignal.timeout(3000), ...options } as never, undefined)
+}
+
+/** 直接构造带附件的兼容 Chat body。 */
+async function captureBodyWith(options: Record<string, unknown>, attachments?: unknown): Promise<Record<string, unknown>> {
+  return wireRequest({ model: 'm', messages: [], signal: AbortSignal.timeout(3000), ...options } as never, attachments as never)
+}
+
+/** 直接构造内部 adapter 发给 `/v1/responses` 的 body。 */
+async function captureResponsesBody(options: Record<string, unknown>, attachments?: unknown): Promise<Record<string, unknown>> {
+  return wireResponsesRequest({ model: 'm', messages: [], signal: AbortSignal.timeout(3000), ...options } as never, attachments as never)
 }
 
 test('wire：options.system 必须发给上游（agent-loop 走 system 槽位，不放 messages）', async () => {
@@ -514,6 +592,7 @@ test('wire：reasoningEffort 要补 reasoning_summary:auto（CodeBuddy 只在两
   assert.equal(body.reasoning_summary, 'auto', '缺它 CodeBuddy 不吐推理内容')
 })
 
+
 test('wire：reasoningEffort 为 none/off 时删字段，且无请求时不硬加（否则触发内容过滤）', async () => {
   // 9router #2071：对普通请求强加 reasoning_effort+summary 会让 CodeBuddy
   // 触发内容过滤报错；"none" 网关不认，必须是删字段。
@@ -522,6 +601,42 @@ test('wire：reasoningEffort 为 none/off 时删字段，且无请求时不硬�
   assert.equal('reasoning_summary' in none, false)
   const plain = await captureBody({ messages: [] })
   assert.equal('reasoning_effort' in plain, false, '没要推理就不能加')
+})
+
+test('Responses wire：内部请求保留图像/工具/推理，并移除 Chat 专属字段', async () => {
+  const body = await captureResponsesBody({
+    system: 'system rules',
+    reasoningEffort: 'high',
+    maxTokens: 321,
+    temperature: 0.2,
+    messages: [
+      { role: 'user', content: [
+        { type: 'text', text: 'look' },
+        { type: 'image', attachment: { attachmentId: 'sha256:resp-image', mediaType: 'image/png', bytes: 11, width: 2, height: 2 } },
+      ] },
+      { role: 'assistant', content: [
+        { type: 'reasoning', text: 'thinking' },
+        { type: 'tool-call', id: 'call_1', name: 'bash', arguments: '{"command":"ls"}' },
+      ] },
+      { role: 'tool', toolCallId: 'call_1', content: [{ type: 'text', text: 'out' }] },
+    ],
+    tools: [{ name: 'bash', description: 'run', parameters: { type: 'object' } }],
+  }, fakeAttachments())
+  assert.equal(body.instructions, 'system rules')
+  assert.equal(body.max_output_tokens, 321)
+  assert.deepEqual(body.reasoning, { effort: 'high', summary: 'auto' })
+  assert.equal('messages' in body, false)
+  assert.equal('stream_options' in body, false)
+  assert.equal('reasoning_effort' in body, false)
+  const input = body.input as Array<Record<string, unknown>>
+  const user = input.find((item) => item.type === 'message' && item.role === 'user')
+  assert.deepEqual(user?.content, [
+    { type: 'input_text', text: 'look' },
+    { type: 'input_image', image_url: 'data:image/png;base64,PHBuZy1ieXRlcz4=' },
+  ])
+  assert.ok(input.some((item) => item.type === 'function_call' && item.call_id === 'call_1'))
+  assert.ok(input.some((item) => item.type === 'function_call_output' && item.call_id === 'call_1'))
+  assert.deepEqual(body.tools, [{ type: 'function', name: 'bash', description: 'run', parameters: { type: 'object' } }])
 })
 
 test('wire：空工具结果发空串，不伪造 (no output) 字面量', async () => {
@@ -620,7 +735,7 @@ test('流式：消费者提前退出必须 cancel 上游（releaseLock 不关 so
   // 下每条中断泄漏一个 fd。
   let cancelled = false
   const body = new ReadableStream<Uint8Array>({
-    pull(c) { c.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"a"}}]}\n\n')) },
+    pull(c) { c.enqueue(new TextEncoder().encode(responsesTextSse('a'))) },
     cancel() { cancelled = true },
   })
   const { RouterAdapter: RA } = await import('./adapter.ts')
@@ -636,7 +751,10 @@ test('流式：消费者提前退出必须 cancel 上游（releaseLock 不关 so
 
 test('流式：单个坏帧跳过，不毁掉整轮（对齐 9router 的容错）', async () => {
   const enc = new TextEncoder()
-  const sse = `data: {"choices":[{"delta":{"content":"good"}}]}\n\ndata: {broken json\n\ndata: [DONE]\n\n`
+  const sse = responsesTextSse('good').replace(
+    'event: response.completed',
+    'event: response.output_text.delta\ndata: {broken json\n\nevent: response.completed',
+  )
   globalThis.fetch = (async () => new Response(enc.encode(sse), { status: 200 })) as typeof fetch
   const { RouterAdapter: RA } = await import('./adapter.ts')
   const adapter = new RA('http://x', { comboModels: async () => [] })
@@ -649,7 +767,7 @@ test('流式：单个坏帧跳过，不毁掉整轮（对齐 9router 的容错�
 
 test('流式：只有坏帧时才按断流处理，且 code 可重试', async () => {
   const enc = new TextEncoder()
-  globalThis.fetch = (async () => new Response(enc.encode('data: {broken\n\n'), { status: 200 })) as typeof fetch
+  globalThis.fetch = (async () => new Response(enc.encode('event: response.output_text.delta\ndata: {broken\n\n'), { status: 200 })) as typeof fetch
   const { RouterAdapter: RA } = await import('./adapter.ts')
   const adapter = new RA('http://x', { comboModels: async () => [] })
   let code = ''
@@ -703,8 +821,9 @@ test('流式：上游不发空行分隔时也要能分帧（前瞻完整 JSON）
   // 部分上游/中间件只发 \n 不发 \n\n。两帧会被拼成 `{...}\n{...}` 而 parse
   // 失败。9router 逐行取天然没这问题，我们按空行分帧，就得补前瞻回退。
   const enc = new TextEncoder()
-  const a = 'data: {"choices":[{"delta":{"content":"A"}}]}\n'
-  const b = 'data: {"choices":[{"delta":{"content":"B"}}]}\n\ndata: [DONE]\n\n'
+  const a = 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"A"}\n'
+  const b = 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"B"}\n'
+    + 'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_test","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"AB"}]}]}}\n\n'
   globalThis.fetch = (async () => new Response(enc.encode(a + b), { status: 200 })) as typeof fetch
   const { RouterAdapter: RA } = await import('./adapter.ts')
   const adapter = new RA('http://x', { comboModels: async () => [] })
@@ -798,24 +917,6 @@ function fakeAttachments(mediaType = 'image/png', data = new TextEncoder().encod
   return store
 }
 
-/** 用给定 attachments 跑一次 stream()，返回上游收到的 body。 */
-async function captureBodyWith(options: Record<string, unknown>, attachments?: unknown): Promise<Record<string, unknown>> {
-  let captured: Record<string, unknown> = {}
-  globalThis.fetch = (async (_url: string, init?: { body?: string }) => {
-    captured = JSON.parse(init?.body ?? '{}') as Record<string, unknown>
-    return new Response('data: [DONE]\n\n', { status: 200 })
-  }) as typeof fetch
-  const adapter = new RouterAdapter(
-    'http://x',
-    { comboModels: async () => [] },
-    () => attachments as never,
-  )
-  for await (const _c of adapter.stream({ model: 'm', messages: [], signal: AbortSignal.timeout(3000), ...options } as never)) {
-    void _c
-  }
-  return captured
-}
-
 /* ---------------- 请求目标：形状与像素预算（issue #8 的回归闸门） ---------------- */
 
 test('目标：请求目标是 0.1.6+ 的 target 形状（width/height/maxBytes），没有 0.1.5 的 maxPixels', async () => {
@@ -866,7 +967,7 @@ test('降级留痕：读图失败会写一条 log，不再静默（issue #8 为�
     undefined,
     (msg) => lines.push(msg),
   )
-  globalThis.fetch = (async () => new Response('data: [DONE]\n\n', { status: 200 })) as typeof fetch
+  globalThis.fetch = (async () => new Response(responsesTextSse('ok'), { status: 200 })) as typeof fetch
   for await (const _c of adapter.stream({
     model: 'm',
     messages: [{ role: 'user', content: [

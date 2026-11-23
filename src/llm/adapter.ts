@@ -1,8 +1,8 @@
 /**
  * DSH llm adapter for dsh-router（provider 固定卡片，名字 Router）。
  *
- * 模型目录 = 组合（自动带出，不可改）。对话转发到本插件 /v1/chat/completions，
- * 由现有路由按组合策略命中供应商模型。
+ * 模型目录 = 组合（自动带出，不可改）。对话转发到本插件 /v1/responses，
+ * 由现有路由按组合策略命中供应商模型；内部调用保持 Responses 端到端。
  *
  * 图文流：adapter 声明图片 modal（`inputModalities` 含 `image`），把 user 消息里的
  * `image` 块序列化成 OpenAI 标准的 `image_url` base64 part，经 /v1 原样透传给
@@ -27,6 +27,9 @@ import {
   type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { mergeUsage, normalizeUsage, toTokenUsage, type UsageTokens } from '../router/usage-tokens.ts'
+import { responsesCodec } from '../protocol/responses.ts'
+import type { JsonObject } from '../protocol/types.ts'
+import { SseSplitter, type SseFrame } from '../protocol/sse.ts'
 
 /**
  * dsh-attachment 的最小本地切面：adapter 只依赖「读一张图片的请求版本」
@@ -306,8 +309,28 @@ function imagePlaceholder(attachmentId: string): string {
   return `[image omitted because the attached bytes could not be read; attachment ${attachmentId}]`
 }
 
-/** 组装 wire 请求体。图片序列化需要读 attachments，故为异步。 */
-async function wireRequest(options: GenerateOptions, attachments: RouterAttachmentStore | undefined, log?: (msg: string) => void): Promise<Record<string, unknown>> {
+export async function wireResponsesRequest(options: GenerateOptions, attachments: RouterAttachmentStore | undefined, log?: (msg: string) => void): Promise<JsonObject> {
+  const chatBody = await wireRequest(options, attachments, log)
+  const body = responsesCodec.fromChat(chatBody as JsonObject, { model: options.model, stream: true })
+
+  // These fields belong to Chat Completions. Responses has its own reasoning shape;
+  // silently forwarding the Chat names makes some providers reject the request.
+  delete body.stream_options
+  delete body.stop
+  const effort = typeof chatBody.reasoning_effort === 'string' ? chatBody.reasoning_effort : undefined
+  delete body.reasoning_effort
+  delete body.reasoning_summary
+  if (effort !== undefined && effort !== '' && effort !== 'auto' && effort !== 'none' && effort !== 'off') {
+    body.reasoning = { effort, summary: 'auto' }
+  }
+  return body
+}
+
+/**
+ * Chat-compatible request body used by the external compatibility path. The
+ * internal DSH adapter uses wireResponsesRequest so it never enters Chat.
+ */
+export async function wireRequest(options: GenerateOptions, attachments: RouterAttachmentStore | undefined, log?: (msg: string) => void): Promise<Record<string, unknown>> {
   const messages = await wireMessages(options, options.system, attachments, log)
   const body: Record<string, unknown> = {
     model: options.model,
@@ -564,6 +587,151 @@ export async function* translateSse(payloads: AsyncIterable<string> | Iterable<s
   throw new LlmError(`SSE payload stream ended without [DONE]${detail}`, 'TRANSPORT')
 }
 
+
+/** Responses SSE frames → DSH StreamChunk, without a Chat protocol round trip. */
+export async function* translateResponsesSse(frames: AsyncIterable<SseFrame> | Iterable<SseFrame>): AsyncGenerator<StreamChunk> {
+  const session = responsesCodec.createSession?.()
+  let nextIndex = 0
+  let textBlock: OpenBlock | undefined
+  let reasoningBlock: OpenBlock | undefined
+  const toolBlocks = new Map<number, OpenBlock>()
+  const order: OpenBlock[] = []
+  let accumulated: UsageTokens | null = null
+  let pendingFailure: { message: string; code: string } | undefined
+  let terminal = false
+
+  const open = (kind: OpenBlock['kind']): OpenBlock => {
+    const block: OpenBlock = { index: nextIndex++, kind, text: '' }
+    order.push(block)
+    return block
+  }
+
+  for await (const frame of frames) {
+    if (terminal || frame.data === '' || frame.data === '[DONE]') continue
+    let eventName = frame.event
+    if (eventName === '') {
+      try {
+        const parsed = JSON.parse(frame.data) as { type?: unknown }
+        if (typeof parsed.type === 'string') eventName = parsed.type
+      } catch {
+        // decodeFrame deliberately ignores malformed payloads; the terminal check below
+        // turns a stream made only of malformed frames into a retryable transport error.
+      }
+    }
+    const events = responsesCodec.decodeFrame(frame.data, eventName, session)
+    for (const event of events) {
+      switch (event.type) {
+        case 'text': {
+          if (textBlock === undefined) {
+            textBlock = open('text')
+            yield { type: 'block-start', index: textBlock.index, blockType: 'text' }
+          }
+          textBlock.text += event.text
+          yield { type: 'text-delta', index: textBlock.index, text: event.text }
+          break
+        }
+        case 'reasoning': {
+          if (reasoningBlock === undefined) {
+            reasoningBlock = open('reasoning')
+            yield { type: 'block-start', index: reasoningBlock.index, blockType: 'reasoning' }
+          }
+          reasoningBlock.text += event.text
+          yield { type: 'reasoning-delta', index: reasoningBlock.index, text: event.text }
+          break
+        }
+        case 'tool-start': {
+          let block = toolBlocks.get(event.index)
+          if (block === undefined) {
+            block = open('tool-call')
+            toolBlocks.set(event.index, block)
+            yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+          }
+          if (typeof event.id === 'string' && event.id !== '') block.callId = event.id
+          if (typeof event.name === 'string' && event.name !== '') block.name = event.name
+          yield {
+            type: 'tool-call-delta',
+            index: block.index,
+            id: ToolCallId(block.callId ?? ''),
+            ...(block.name !== undefined ? { name: block.name } : {}),
+            argumentsDelta: '',
+          }
+          break
+        }
+        case 'tool-args': {
+          let block = toolBlocks.get(event.index)
+          if (block === undefined) {
+            block = open('tool-call')
+            toolBlocks.set(event.index, block)
+            yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+          }
+          block.text += event.delta
+          yield {
+            type: 'tool-call-delta',
+            index: block.index,
+            id: ToolCallId(block.callId ?? ''),
+            ...(block.name !== undefined ? { name: block.name } : {}),
+            argumentsDelta: event.delta,
+          }
+          break
+        }
+        case 'usage':
+          accumulated = mergeUsage(accumulated, {
+            promptTokens: event.promptTokens,
+            completionTokens: event.completionTokens,
+            cachedTokens: event.cachedTokens,
+          })
+          break
+        case 'error':
+          pendingFailure = { message: event.message, code: 'SERVER' }
+          break
+        case 'finish': {
+          const complete = order.filter((block) => block.kind !== 'tool-call' || completeJson(block.text))
+          const incomplete = order.filter((block) => block.kind === 'tool-call' && !completeJson(block.text))
+          for (const block of complete) yield { type: 'block-end', index: block.index, block: closeBlock(block) }
+          if (incomplete.length > 0) {
+            for (const block of incomplete) {
+              yield {
+                type: 'block-end',
+                index: block.index,
+                block: { type: 'tool-call', id: ToolCallId(block.callId ?? ''), name: '', arguments: '{}' },
+              }
+            }
+            pendingFailure = {
+              message: `upstream closed the stream before ${incomplete.length} tool call argument${incomplete.length > 1 ? 's were' : ' was'} complete`,
+              code: EMPTY_RESPONSE_CODE,
+            }
+          }
+          if (accumulated !== null) {
+            const usage = toTokenUsage(accumulated)
+            if (usage !== null) yield { type: 'usage', usage }
+          }
+          let reason: { kind: string; failure?: unknown }
+          if (pendingFailure !== undefined || event.reason === 'error') {
+            reason = { kind: 'error', failure: pendingFailure ?? { message: 'upstream response failed', code: 'SERVER' } }
+          } else if (event.reason === 'length') {
+            reason = { kind: 'max-tokens' }
+          } else if (event.reason === 'tool-calls') {
+            reason = { kind: 'tool-calls' }
+          } else if (event.reason === 'content-filter') {
+            reason = { kind: 'error', failure: { message: 'upstream response was filtered', code: 'CONTENT_FILTER' } }
+          } else {
+            reason = { kind: 'stop' }
+          }
+          yield {
+            type: 'finish',
+            reason: reason.kind === 'stop' && order.length === 0
+              ? { kind: 'error', failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE } }
+              : (reason as never),
+          }
+          terminal = true
+          break
+        }
+      }
+    }
+  }
+  if (!terminal) throw new LlmError('SSE payload stream ended without response.completed', 'TRANSPORT')
+}
+
 /** 上游 finish_reason → DSH finish reason；空串（「未终止」）返回 undefined。 */
 function mapFinishReason(reason: string): { kind: string; failure?: unknown } | undefined {
   switch (reason) {
@@ -618,7 +786,7 @@ function completeJson(text: string): boolean {
 
 /**
  * DSH adapter：provider `router`。模型目录 = 组合；stream 转发到本插件
- * /v1/chat/completions（组合路由在 /v1 内完成）。
+ * /v1/responses（组合路由在 /v1 内完成）。
  */
 /** Router provider 对外暴露的推理等级（对齐 dsh/DeepSeek：off/low/high/max）。 */
 const ROUTER_REASONING_EFFORTS: readonly LlmReasoningEffortInfo[] = [
@@ -707,7 +875,7 @@ export class RouterAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    const body = await wireRequest(options, this.resolveAttachments(), this.log)
+    const body = await wireResponsesRequest(options, this.resolveAttachments(), this.log)
     const controller = new AbortController()
     const onAbort = (): void => controller.abort()
     options.signal?.addEventListener('abort', onAbort, { once: true })
@@ -717,7 +885,7 @@ export class RouterAdapter extends LlmAdapter {
       // 解析器自己抛错时也落进下面这个 catch，于是「端口拿不到」是以
       // LlmError 消息报出来的，而不是一句无从查证的 `fetch failed`。
       const base = typeof this.baseURL === 'function' ? this.baseURL() : this.baseURL
-      resp = await fetch(`${base}/chat/completions`, {
+      resp = await fetch(`${base}/responses`, {
         method: 'POST',
         // attributionHeaders() 是 dsh-llm 对 adapter 的硬契约：每个 provider
         // 请求都必须带（LlmAdapter 类注释原话）。它给出
@@ -751,7 +919,7 @@ export class RouterAdapter extends LlmAdapter {
         )
       }
       if (resp.body === null) return
-      yield* translateSse(ssePayloads(resp.body, this.idleTimeoutMs))
+      yield* translateResponsesSse(sseFrames(resp.body, this.idleTimeoutMs))
     } finally {
       options.signal?.removeEventListener('abort', onAbort)
     }
@@ -813,28 +981,14 @@ function looksComplete(payload: string): boolean {
  * 跨块边界：一个 `data:` 行可能横跨两次 read()，所以留 `buffer` 接住
  * 最后一段未完整的行（9router 的 pipeTransformedSSE 同样处理）。
  */
-async function* ssePayloads(body: ReadableStream<Uint8Array>, idleTimeoutMs: number): AsyncGenerator<string> {
+
+/**
+ * Incrementally read event-aware SSE frames for the native Responses path.
+ * Unlike `ssePayloads`, this keeps the `event:` name needed by Responses.
+ */
+async function* sseFrames(body: ReadableStream<Uint8Array>, idleTimeoutMs: number): AsyncGenerator<SseFrame> {
   const reader = body.getReader()
-  const decoder = new TextDecoder('utf-8', { fatal: false })
-  let buffer = ''
-  /** 攒一帧内的多行 data（SSE 规范：多行用 \n 连起来）。**必须**是局部
-   *  状态 —— 放模块级会让并发请求互相串数据。 */
-  let payload = ''
-  /**
-   * 带**空闲超时**的读：上游连上后若长时间一个字节都不吐，就读穿不了 ——
-   * 没有超时的话这里会永久挂着，连接和 in-flight 请求都收不回。
-   *
-   * 为什么必须有（issue #6 的另一半）：`dsh-llm-pi-ai`（自定义供应商走的那条
-   * openai-completions adapter）有 `idleWatchdog`，默认 **300s** 空闲即
-   * `LLM_STREAM_IDLE_TIMEOUT` 中止；而本 adapter 此前**没有任何超时**，只靠
-   * 调用方的 `options.signal`。于是同一个组合，走内置 Router 时上游一停摆就
-   * 永久挂住（占用连接、且该请求永不收尾），走自定义供应商时 300s 后被放弃
-   * —— 放弃又会触发服务端那条「客户端断开不回收」的泄漏路径，两边叠加就是
-   * 「用久了报 connection error」。
-   *
-   * 只守**空闲**、不设总时长：长生成可以跑很久，只要还在吐块就不该被打断
-   * （总时长封顶会让长回答写到一半被砍）。
-   */
+  const splitter = new SseSplitter()
   const readWithIdleTimeout = (): Promise<ReadableStreamReadResult<Uint8Array>> =>
     new Promise((resolve, reject) => {
       const timer = setTimeout(
@@ -850,44 +1004,11 @@ async function* ssePayloads(body: ReadableStream<Uint8Array>, idleTimeoutMs: num
     for (;;) {
       const { done, value } = await readWithIdleTimeout()
       if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\n')
-      buffer = lines.pop() ?? '' // 最后一段可能没换行，留给下一块
-      for (const line of lines) {
-        const t = line.trim()
-        if (t.startsWith('data:')) {
-          // 前瞻回退：部分上游不发空行分隔，直接连着发下一帧。这时若已攒的
-          // payload 本身是个完整 JSON，就先把它交出去 —— 否则两帧会被拼成
-          // `{...}\n{...}` 而 parse 失败，整轮报废（9router 逐行取，天然
-          // 没这问题；我们按空行分帧，就得补这个回退）。
-          if (payload.length > 0 && looksComplete(payload)) {
-            yield payload
-            payload = ''
-          }
-          payload += (payload.length > 0 ? '\n' : '') + t.slice(5).trimStart()
-          continue
-        }
-        // 空行 = 一帧结束
-        if (t === '' && payload.length > 0) {
-          yield payload
-          payload = ''
-        }
-      }
+      for (const frame of splitter.push(value)) yield frame
     }
-    // 流正常结束：末尾没换行的内容也要收（可能有最后一帧）
-    if (buffer.length > 0) {
-      const t = buffer.trim()
-      if (t.startsWith('data:')) payload += (payload.length > 0 ? '\n' : '') + t.slice(5).trimStart()
-    }
-    if (payload.length > 0) yield payload
+    for (const frame of splitter.end()) yield frame
   } finally {
-    // 释放锁**之后还必须 cancel**：releaseLock() 只解除 JS 侧的 reader 绑定，
-    // 不通知传输层 —— 上游那条 TCP 连接和 in-flight 请求会原样挂着。
-    // dsh-llm 在消费者提前退出时必走 `iterator.return()`（用户取消 /
-    // agent-loop 收敛 / 异常），于是每次中断泄漏一条到本地路由器的连接；
-    // 长会话下 fd 耗尽 → ECONNRESET / 端口耗尽。
-    // 顺序不能反：cancel() 要求没有活跃 reader，所以先 releaseLock。
-    try { reader.releaseLock() } catch { /* 有待定 read 时会抛，忽略 */ }
+    try { reader.releaseLock() } catch { /* a pending read may still hold it */ }
     await body.cancel().catch(() => {})
   }
 }

@@ -191,7 +191,7 @@ test('端到端 · 空流：每种协议都给出形状合法的收尾，而不�
       assert.ok(body.includes('message_start') && body.includes('message_stop'), 'anthropic 空流形状不完整')
     }
     if (protocol === 'responses') {
-      assert.ok(body.includes('response.completed'), 'responses 空流缺收尾')
+      assert.ok(body.includes('response.failed'), 'responses 空流应以失败终态收尾')
     }
   }
 })

@@ -47,6 +47,7 @@ interface RawUsage {
   candidatesTokenCount?: number
   cachedContentTokenCount?: number
   prompt_tokens_details?: { cached_tokens?: number }
+  input_tokens_details?: { cached_tokens?: number }
 }
 
 /** 取有限数，其余当 0（NaN 会毒穿整个累加：`Math.max(x, NaN) === NaN`）。 */
@@ -80,7 +81,8 @@ export function normalizeUsage(raw: unknown): UsageTokens | null {
     num(u.cached_tokens) +
     num(u.cache_read_input_tokens) +
     num(u.cachedContentTokenCount) +
-    num(u.prompt_tokens_details?.cached_tokens)
+    num(u.prompt_tokens_details?.cached_tokens) +
+    num(u.input_tokens_details?.cached_tokens)
 
   // promptTokenCount 是 Gemini 形态；input_tokens 是 Claude 形态
   let prompt = num(u.prompt_tokens) + num(u.input_tokens) + num(u.promptTokenCount)
@@ -153,12 +155,14 @@ export function estimateTokens(chars: number): number {
  */
 export function usageFromJsonBody(body: string): UsageTokens | null {
   try {
-    return normalizeUsage((JSON.parse(body) as { usage?: unknown }).usage)
+    const parsed = JSON.parse(body) as { usage?: unknown; response?: { usage?: unknown } }
+    return normalizeUsage(parsed.usage ?? parsed.response?.usage)
   } catch {
     // 不是 JSON → 按 SSE 尾部扫
   }
   let merged: UsageTokens | null = null
-  for (const frame of body.split('\n\n').slice(-3)) {
+  const normalized = body.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  for (const frame of normalized.split('\n\n').slice(-3)) {
     for (const line of frame.split('\n')) {
       if (!line.startsWith('data:')) continue
       const payload = line.slice(5).trim()
@@ -217,6 +221,10 @@ function finiteInt(v: number): number {
 
 /** 一帧 SSE 里的可见文本内容（用于输出字符数估算）。 */
 function frameText(chunk: Record<string, unknown>): string {
+  const type = typeof chunk.type === 'string' ? chunk.type : ''
+  if (type === 'response.output_text.delta' || type === 'response.reasoning_text.delta' || type === 'response.reasoning_summary_text.delta') {
+    return typeof chunk.delta === 'string' ? chunk.delta : ''
+  }
   const choices = chunk.choices as Array<Record<string, unknown>> | undefined
   if (choices === undefined) return ''
   let out = ''
@@ -260,12 +268,26 @@ export interface StreamUsage {
 export function tapStreamUsage(
   source: ReadableStream<Uint8Array>,
   startedAt: number,
+  options: { propagateErrors?: boolean } = {},
 ): { stream: ReadableStream<Uint8Array>; done: () => Promise<StreamUsage> } {
   const dec = new TextDecoder()
   let buf = ''
   let merged: UsageTokens | null = null
   let outputChars = 0
   let firstAt = 0
+  let pendingCR = false
+
+  const normalizeEolChunk = (text: string, flush = false): string => {
+    if (pendingCR) {
+      text = `\r${text}`
+      pendingCR = false
+    }
+    if (!flush && text.endsWith('\r')) {
+      pendingCR = true
+      text = text.slice(0, -1)
+    }
+    return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  }
 
   const parseFrame = (frame: string): void => {
     for (const line of frame.split('\n')) {
@@ -288,22 +310,31 @@ export function tapStreamUsage(
       try {
         for (;;) {
           const { done, value } = await reader.read()
-          if (done) break
+          if (done) {
+            buf += normalizeEolChunk(dec.decode(), true)
+            break
+          }
           if (firstAt === 0) firstAt = Date.now()
           // 统计用 stream:true 解码（跨 chunk 边界的多字节字符不会被切断）；
           // 转发出去的是原始字节 value，解码与转发互不影响
-          buf += dec.decode(value as Uint8Array, { stream: true })
-          let sep: number
-          while ((sep = buf.indexOf('\n\n')) >= 0) {
-            const frame = buf.slice(0, sep + 2)
-            buf = buf.slice(sep + 2)
-            parseFrame(frame)
+          buf += normalizeEolChunk(dec.decode(value as Uint8Array, { stream: true }))
+          let match: RegExpExecArray | null
+          const boundary = /\n\n/g
+          while ((match = boundary.exec(buf)) !== null) {
+            const end = match.index + match[0].length
+            parseFrame(buf.slice(0, end))
+            buf = buf.slice(end)
+            boundary.lastIndex = 0
           }
           ctrl.enqueue(value as Uint8Array)
         }
         if (buf !== '') parseFrame(buf)
-      } catch {
-        // 消费方取消会让挂起的 read 收尾 —— 静默退出
+      } catch (error) {
+        // Existing Chat behavior treats cancellation and upstream errors as a closed stream.
+        // Native Responses can opt into propagating errors so incomplete SSE is never committed as JSON.
+        if (options.propagateErrors) {
+          try { ctrl.error(error) } catch { /* consumer already cancelled */ }
+        }
       } finally {
         try { reader.releaseLock() } catch { /* 有待定 read 时会抛，忽略 */ }
       }

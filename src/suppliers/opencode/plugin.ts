@@ -31,9 +31,10 @@
  * （连接池、签到由能力检测自动隐藏）。
  */
 import { randomBytes } from 'node:crypto'
-import type { ChatRequest, ModelInfo } from '../../router/types.ts'
-import type { ChatOnceResult, SupplierEnv, SupplierModule, SupplierStatusNow } from '../contract.ts'
+import type { ChatRequest, ModelInfo, ResponsesRequest } from '../../router/types.ts'
+import type { ChatOnceResult, ResponsesOnceResult, SupplierEnv, SupplierModule, SupplierStatusNow } from '../contract.ts'
 import { stateFromHttpStatus } from '../http-state.ts'
+import { nativeResponsesBody, requestNativeResponses } from '../responses-http.ts'
 
 
 export const id = 'opencode'
@@ -119,7 +120,7 @@ const KNOWN_FREE = new Set(['big-pickle'])
  * 只认 `function.name`（OpenAI chat 形态）——Zen 免费档是 chat/completions，
  * 不走 responses 的扁平 `name` 形态。
  */
-function ensureDecoyTools(obj: Record<string, unknown>): void {
+function ensureDecoyTools(obj: Record<string, unknown>, responses = false): void {
   const tools = Array.isArray(obj.tools) ? (obj.tools as Array<Record<string, unknown>>) : []
   const names = new Set<string>()
   for (const t of tools) {
@@ -129,10 +130,9 @@ function ensureDecoyTools(obj: Record<string, unknown>): void {
   }
   for (const d of DECOY_TOOLS) {
     if (names.has(d.name)) continue
-    tools.push({
-      type: 'function',
-      function: { name: d.name, description: d.description, parameters: { type: 'object', properties: {} } },
-    })
+    tools.push(responses
+      ? { type: 'function', name: d.name, description: d.description, parameters: { type: 'object', properties: {} } }
+      : { type: 'function', function: { name: d.name, description: d.description, parameters: { type: 'object', properties: {} } } })
   }
   obj.tools = tools
 }
@@ -258,6 +258,37 @@ export default function factory(env: SupplierEnv): SupplierModule {
         return { ok: false, state: 'transport', message: msg }
       }
       return { ok: true, stream: upstream.body }
+    },
+    /** Native Responses path; the free endpoint requires SSE even for JSON callers. */
+    async responsesOnce(_uid: string, _lv: string, req: ResponsesRequest): Promise<ResponsesOnceResult> {
+      if (!isFreeModel(req.model)) {
+        const msg = `unknown free model ${JSON.stringify(req.model)}`
+        return { ok: false, state: 'no_such_model', message: msg }
+      }
+      let body: string
+      try {
+        const parsed = JSON.parse(nativeResponsesBody(req, stripAlias(req.model, currentAlias()))) as Record<string, unknown>
+        ensureDecoyTools(parsed, true)
+        parsed.stream = true
+        body = JSON.stringify(parsed)
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error)
+        return { ok: false, state: 'bad_request', message: `invalid Responses request: ${msg}` }
+      }
+      const upstreamReq: ResponsesRequest = { ...req, rawBody: body, stream: true }
+      return requestNativeResponses(
+        `${BASE}/responses`,
+        {
+          Authorization: 'Bearer public',
+          'User-Agent': UA,
+          'x-opencode-client': 'desktop',
+          ...sessionHeaders(),
+        },
+        body,
+        upstreamReq,
+        'opencode',
+        stateFromHttpStatus,
+      )
     },
     dispose: (): void => {
       modelsCache = undefined

@@ -69,7 +69,7 @@ export class StreamState {
     const out: string[] = []
     if (!this.started) {
       this.started = true
-      out.push(...codecOf(this.to).startFrames({ model: this.model, stream: true }))
+      out.push(...codecOf(this.to).startFrames({ model: this.model, stream: true }, this.encodeSession))
     }
     for (const ev of events) {
       if (ev.type === 'usage') this.mergeUsage(ev)
@@ -101,7 +101,7 @@ export class StreamState {
       // startFrames 是不够的 —— Anthropic 客户端等 message_stop、Codex 等
       // response.completed，缺收尾帧它们会报「流被截断」而不是「上游没答」。
       this.started = true
-      return [...enc.startFrames(ctx), ...enc.endFrames(ctx, this.encodeSession)]
+      return [...enc.startFrames(ctx, this.encodeSession), ...enc.endFrames(ctx, this.encodeSession)]
     }
     // finish 帧要拿到**已经累计好的**用量：有的协议（Anthropic）把 stop_reason
     // 与 output_tokens 绑在同一帧里，而 finish 事件本身不带 usage。所以要派生

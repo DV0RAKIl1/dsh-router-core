@@ -477,8 +477,55 @@ export function apply(rawContext: unknown): void {
     })
   }))
 
-  // OpenAI Responses（Codex 用）。
-  route('/v1/responses', enterProtocol('responses'))
+  // OpenAI Responses (Codex): preserve its native JSON and SSE payload end-to-end.
+  route('/v1/responses', withV1Auth(async (req, res) => {
+    let rawBody: string
+    try {
+      rawBody = await readBody(req, 8 << 20)
+    } catch {
+      writeJson(res, 413, { error: { message: 'request body too large', type: 'api_error', code: 'request_too_large' } })
+      return
+    }
+    let body: Record<string, unknown>
+    try {
+      const parsed: unknown = JSON.parse(rawBody)
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('body must be a JSON object')
+      body = parsed as Record<string, unknown>
+    } catch {
+      writeJson(res, 400, { error: { message: 'invalid JSON body', type: 'api_error', code: 'invalid_request' } })
+      return
+    }
+    const model = typeof body.model === 'string' ? body.model : ''
+    if (model === '') {
+      writeJson(res, 400, { error: { message: 'missing model', type: 'api_error', code: 'invalid_request' } })
+      return
+    }
+    const sessionRaw = req.headers['x-dsh-router-session']
+    const session = (typeof sessionRaw === 'string' && sessionRaw !== '' ? sessionRaw : undefined)
+      ?? clientIdentityOf(body, req.headers['user-agent'])
+    const clientAbort = new AbortController()
+    const onRequestAborted = (): void => clientAbort.abort(new Error('client disconnected during Responses request'))
+    const onResponseClose = (): void => {
+      if (!res.writableEnded) clientAbort.abort(new Error('client disconnected during Responses response'))
+    }
+    req.once('aborted', onRequestAborted)
+    res.once('close', onResponseClose)
+    if (req.aborted) onRequestAborted()
+    if (res.destroyed || res.writableEnded) onResponseClose()
+    try {
+      await router.responses({
+        rawBody,
+        stream: body.stream === true,
+        model,
+        lv: lvOf(body, 'responses'),
+        ...(session === undefined ? {} : { session }),
+        signal: clientAbort.signal,
+      }, res)
+    } finally {
+      req.removeListener('aborted', onRequestAborted)
+      res.removeListener('close', onResponseClose)
+    }
+  }))
 
   // Google Gemini。Gemini 的模型名在 **URL 路径**里
   // （`/v1beta/models/<model>:generateContent`），所以走 prefix 路由自己解析

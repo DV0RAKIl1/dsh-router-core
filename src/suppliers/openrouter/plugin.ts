@@ -9,10 +9,11 @@
  * 一个供应商可有多个命名 key，按池顺序/策略尝试。凭证存通用 CredentialStore
  * （SQLite：auths/credentials.sqlite，{ name, apiKey }）。
  */
-import type { ChatRequest, ModelInfo } from '../../router/types.ts'
-import type { AccountState, ChatOnceResult, SupplierStatusNow } from '../contract.ts'
+import type { ChatRequest, ModelInfo, ResponsesRequest } from '../../router/types.ts'
+import type { AccountState, ChatOnceResult, ResponsesOnceResult, SupplierStatusNow } from '../contract.ts'
 import type { SupplierEnv, SupplierModule } from '../contract.ts'
 import { stateFromHttpStatus } from '../http-state.ts'
+import { nativeResponsesBody, requestNativeResponses } from '../responses-http.ts'
 
 export const id = 'openrouter'
 export const name = 'OpenRouter'
@@ -221,6 +222,34 @@ export default function factory(env: SupplierEnv): SupplierModule {
         return { ok: false, state: 'transport', message: msg }
       }
       return { ok: true, status: upstream.status, body: text }
+    },
+    /** Native Responses path: preserve the upstream Responses JSON/SSE wire format. */
+    async responsesOnce(uid: string, _lv: string, req: ResponsesRequest): Promise<ResponsesOnceResult> {
+      const acct = getKey(uid)
+      if (acct === undefined) {
+        const msg = `unknown account ${JSON.stringify(uid)}`
+        return { ok: false, state: 'no_such_model', message: msg }
+      }
+      const base = stripAlias(req.model, currentAlias())
+      let body: string
+      try {
+        body = nativeResponsesBody(req, base)
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error)
+        return { ok: false, state: 'bad_request', message: `invalid Responses request: ${msg}` }
+      }
+      return requestNativeResponses(
+        `${BASE}/responses`,
+        {
+          Authorization: `Bearer ${acct.apiKey}`,
+          'HTTP-Referer': 'https://endpoint-proxy.local',
+          'X-Title': 'dsh-router',
+        },
+        body,
+        req,
+        'openrouter',
+        stateFromHttpStatus,
+      )
     },
     dispose: (): void => {
       modelsCache = undefined

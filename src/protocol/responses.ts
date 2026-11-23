@@ -23,6 +23,7 @@
 import {
   type ChatEvent,
   type CodecContext,
+  type CodecSession,
   type JsonObject,
   type ProtocolCodec,
   arr,
@@ -92,13 +93,13 @@ export const responsesCodec: ProtocolCodec = {
         })
         continue
       }
-      const text = contentText(msg.content)
-      // 文本永远是 message 项（空文本就不造一个空 message）
-      if (text !== '') {
+      const content = responsesMessageContent(msg.content, role === 'assistant' ? 'assistant' : 'user')
+      // 文本或图片至少有一种才造 message；只有 tool_calls 的 assistant 不需要空 message。
+      if ((typeof content === 'string' && content !== '') || (Array.isArray(content) && content.length > 0)) {
         input.push({
           type: 'message',
           role: role === 'assistant' ? 'assistant' : 'user',
-          content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text }],
+          content,
         })
       }
       // assistant 的 tool_calls → 每个一个 `function_call` 项（Responses 没有
@@ -130,14 +131,27 @@ export const responsesCodec: ProtocolCodec = {
 
   /* ---------------- 响应侧：Responses SSE → ChatEvent ---------------- */
 
-  decodeFrame(frame, event) {
+  createSession() {
+    return { state: newResponsesState() }
+  },
+
+  startFrames(ctx, session) {
+    const state = responsesSession(session)
+    return [responsesEvent(state, 'response.created', {
+      type: 'response.created',
+      response: { id: state.responseId, object: 'response', status: 'in_progress', model: ctx.model, output: [] },
+    })]
+  },
+
+  decodeFrame(frame, event, session) {
     let payload: JsonObject
-    try {
-      payload = JSON.parse(frame) as JsonObject
-    } catch {
-      return []
-    }
+    try { payload = JSON.parse(frame) as JsonObject } catch { return [] }
+    const state = responsesSession(session)
+    const response = obj(payload.response)
+    const responseId = str(response?.id)
+    if (responseId !== undefined) state.responseId = responseId
     switch (event) {
+      case 'response.created': return []
       case 'response.output_text.delta': {
         const delta = str(payload.delta)
         return delta === undefined ? [] : [{ type: 'text', text: delta }]
@@ -149,213 +163,355 @@ export const responsesCodec: ProtocolCodec = {
       }
       case 'response.function_call_arguments.delta': {
         const delta = str(payload.delta)
-        if (delta === undefined || delta === '') return []
-        // output_index 是「这一轮里第几个输出项」，与函数名无关；用 item_id 映射
-        // 成连续 index 的活儿在 decode 层做不了（无状态），故这里直接用
-        // output_index，由调方保证它与 tool-start 用的是同一套编号。
-        return [{ type: 'tool-args', index: num(payload.output_index) ?? 0, delta }]
+        const outputIndex = num(payload.output_index) ?? 0
+        const index = state.decodedToolIndexes[String(outputIndex)]
+        return delta === undefined || delta === '' || index === undefined ? [] : [{ type: 'tool-args', index, delta }]
       }
-      case 'response.output_item.added':
-        return outputItemEvents(payload)
+      case 'response.output_item.added': {
+        const responseStatus = str(response?.status)
+        if (responseStatus === 'failed' || responseStatus === 'cancelled' || responseStatus === 'canceled') {
+          const error = obj(response?.error)
+          const message = str(error?.message) ?? `upstream response ${responseStatus}`
+          state.error = message
+          return [{ type: 'error', message }, { type: 'finish', reason: 'error' }]
+        }
+        return outputItemEvents(payload, state)
+      }
       case 'response.completed':
-        return completedEvents(payload)
-      case 'response.failed':
-      case 'error': {
-        const err = obj(obj(payload.response)?.error) ?? obj(payload.error)
-        const message = str(err?.message) ?? str(payload.message) ?? 'upstream error'
-        return [{ type: 'error', message }]
+      case 'response.incomplete': {
+        const events = completedEvents(payload, state)
+        if (state.error === undefined) return events
+        return [{ type: 'error', message: state.error }, { type: 'finish', reason: 'error' }]
       }
-      default:
-        return []
+      case 'response.failed':
+      case 'response.cancelled':
+      case 'response.canceled':
+      case 'error': {
+        const responsePayload = obj(payload.response)
+        const responseStatus = str(responsePayload?.status)
+        const err = obj(responsePayload?.error) ?? obj(payload.error)
+        const message = str(err?.message) ?? str(payload.message)
+          ?? (event === 'response.cancelled' || event === 'response.canceled' || responseStatus === 'cancelled' || responseStatus === 'canceled'
+            ? 'upstream response cancelled'
+            : 'upstream error')
+        state.error = message
+        return [{ type: 'error', message }, { type: 'finish', reason: 'error' }]
+      }
+      default: return []
     }
   },
 
   /* ---------------- 响应侧：ChatEvent → Responses SSE ---------------- */
 
-  encodeFrame(event) {
+  encodeFrame(event, session) {
+    const state = responsesSession(session)
     switch (event.type) {
-      case 'text':
-        return [
-          eventFrame(
-            'response.output_text.delta',
-            JSON.stringify({ type: 'response.output_text.delta', output_index: 0, delta: event.text }),
-          ),
-        ]
-      case 'reasoning':
-        return [
-          eventFrame(
-            'response.reasoning_summary_text.delta',
-            JSON.stringify({ type: 'response.reasoning_summary_text.delta', output_index: 0, delta: event.text }),
-          ),
-        ]
-      case 'tool-start':
-        return [
-          eventFrame(
-            'response.output_item.added',
-            JSON.stringify({
-              type: 'response.output_item.added',
-              output_index: event.index,
-              item: {
-                type: 'function_call',
-                id: event.id ?? `fc_${event.index}`,
-                call_id: event.id ?? `call_${event.index}`,
-                name: event.name ?? '',
-                arguments: '',
-              },
-            }),
-          ),
-        ]
-      case 'tool-args':
-        return [
-          eventFrame(
-            'response.function_call_arguments.delta',
-            JSON.stringify({
-              type: 'response.function_call_arguments.delta',
-              item_id: `fc_${event.index}`,
-              output_index: event.index,
-              delta: event.delta,
-            }),
-          ),
-        ]
-      case 'usage':
-        return [] // usage 只在 response.completed 里给，见 endFrames
+      case 'text': {
+        const { index, item, added } = ensureResponsesMessage(state)
+        appendResponsesText(item, event.text)
+        const frames: string[] = []
+        if (added) {
+          frames.push(responsesEvent(state, 'response.output_item.added', {
+            type: 'response.output_item.added', output_index: index,
+            item: { id: item.id, type: 'message', status: 'in_progress', role: 'assistant', content: [] },
+          }))
+          frames.push(responsesEvent(state, 'response.content_part.added', {
+            type: 'response.content_part.added', item_id: item.id, output_index: index, content_index: 0,
+            part: { type: 'output_text', text: '', annotations: [] },
+          }))
+        }
+        frames.push(responsesEvent(state, 'response.output_text.delta', {
+          type: 'response.output_text.delta', item_id: item.id, output_index: index, content_index: 0, delta: event.text,
+        }))
+        return frames
+      }
+      case 'reasoning': {
+        const { index, item, added } = ensureResponsesReasoning(state)
+        const summary = (item.summary as JsonObject[])[0]!
+        summary.text = String(summary.text ?? '') + event.text
+        const frames: string[] = []
+        if (added) frames.push(responsesEvent(state, 'response.output_item.added', {
+          type: 'response.output_item.added', output_index: index,
+          item: { id: item.id, type: 'reasoning', status: 'in_progress', summary: [] },
+        }))
+        frames.push(responsesEvent(state, 'response.reasoning_summary_text.delta', {
+          type: 'response.reasoning_summary_text.delta', item_id: item.id, output_index: index, summary_index: 0, delta: event.text,
+        }))
+        return frames
+      }
+      case 'tool-start': {
+        const index = state.output.length
+        const item: JsonObject = {
+          type: 'function_call', id: `fc_${event.index}_${state.responseId}`, status: 'in_progress',
+          call_id: event.id ?? `call_${event.index}`, name: event.name ?? '', arguments: '',
+        }
+        state.toolIndexes[String(event.index)] = index
+        state.output.push(item)
+        return [responsesEvent(state, 'response.output_item.added', {
+          type: 'response.output_item.added', output_index: index,
+          item: { ...item },
+        })]
+      }
+      case 'tool-args': {
+        const outputIndex = state.toolIndexes[String(event.index)]
+        const item = outputIndex === undefined ? undefined : state.output[outputIndex]
+        if (item === undefined || item.type !== 'function_call') return []
+        item.arguments = String(item.arguments ?? '') + event.delta
+        return [responsesEvent(state, 'response.function_call_arguments.delta', {
+          type: 'response.function_call_arguments.delta', item_id: item.id, output_index: outputIndex, delta: event.delta,
+        })]
+      }
       case 'error':
-        return [
-          eventFrame(
-            'error',
-            JSON.stringify({ type: 'error', code: 'server_error', message: event.message }),
-          ),
-        ]
-      case 'finish':
-        return [] // 收尾在 response.completed，由 endFrames 负责
+        state.error = event.message
+        return [responsesEvent(state, 'error', { type: 'error', code: 'server_error', message: event.message })]
+      case 'usage':
+      case 'finish': return []
     }
   },
 
-  startFrames() {
-    return [
-      eventFrame(
-        'response.created',
-        JSON.stringify({ type: 'response.created', response: { id: `resp_${Date.now().toString(36)}`, status: 'in_progress', output: [] } }),
-      ),
-    ]
+  /** Build a standard Responses response from normalized Chat events. */
+  encodeJson(events, ctx) {
+    const state = newResponsesState()
+    let status = 'completed'
+    let usage = { input: 0, output: 0, cached: 0 }
+    for (const ev of events) {
+      switch (ev.type) {
+        case 'text': {
+          const { item } = ensureResponsesMessage(state)
+          appendResponsesText(item, ev.text)
+          break
+        }
+        case 'reasoning': {
+          const { item } = ensureResponsesReasoning(state)
+          const summary = (item.summary as JsonObject[])[0]!
+          summary.text = String(summary.text ?? '') + ev.text
+          break
+        }
+        case 'tool-start': {
+          const index = state.output.length
+          const item: JsonObject = {
+            type: 'function_call', id: `fc_${ev.index}_${state.responseId}`, status: 'completed',
+            call_id: ev.id ?? `call_${ev.index}`, name: ev.name ?? '', arguments: '',
+          }
+          state.toolIndexes[String(ev.index)] = index
+          state.output.push(item)
+          break
+        }
+        case 'tool-args': {
+          const index = state.toolIndexes[String(ev.index)]
+          const item = index === undefined ? undefined : state.output[index]
+          if (item !== undefined && item.type === 'function_call') item.arguments = String(item.arguments ?? '') + ev.delta
+          break
+        }
+        case 'finish':
+          if (ev.reason === 'length' || ev.reason === 'content-filter') status = 'incomplete'
+          else if (ev.reason === 'error') status = 'failed'
+          break
+        case 'usage': usage = { input: ev.promptTokens, output: ev.completionTokens, cached: ev.cachedTokens }; break
+        case 'error': state.error = ev.message; status = 'failed'; break
+      }
+    }
+    const itemStatus = status === 'completed' ? 'completed' : 'incomplete'
+    for (const item of state.output) item.status = itemStatus
+    const response: JsonObject = {
+      id: state.responseId, object: 'response', status, model: ctx.model, output: state.output,
+    }
+    if (events.some((ev) => ev.type === 'usage')) {
+      response.usage = {
+        input_tokens: usage.input, output_tokens: usage.output, total_tokens: usage.input + usage.output,
+        ...(usage.cached > 0 ? { input_tokens_details: { cached_tokens: usage.cached } } : {}),
+      }
+    }
+    if (status === 'incomplete') {
+      const reason = events.some((ev) => ev.type === 'finish' && ev.reason === 'content-filter') ? 'content_filter' : 'max_output_tokens'
+      response.incomplete_details = { reason }
+    }
+    if (status === 'failed') response.error = { code: 'server_error', message: state.error ?? 'upstream error' }
+    return response
   },
 
-  /**
-   * 流结束帧：`response.completed` 带一个完整的 response 对象。
-   *
-   * 用量与收尾原因都从 `ctx` 来（`StreamState.finishStream` 填），因为 Codex
-   * 读的是 `response.completed` 里的 `status`/`usage`，而不是一个 finish_reason
-   * 字段 —— 少了这一帧客户端会一直等流结束。
-   */
-  endFrames(ctx) {
-    return [completedFrame(ctx.model, ctx.stream ? ctx.usage : undefined, ctx.finish)]
+  /** Stream finalizers include full item contents and correlated IDs. */
+  endFrames(ctx, session) {
+    const state = responsesSession(session)
+    const frames: string[] = []
+    const terminalStatus = ctx.finish === 'length' || ctx.finish === 'content-filter'
+      ? 'incomplete'
+      : ctx.finish === 'error' ? 'failed' : 'completed'
+    const itemStatus = terminalStatus === 'completed' ? 'completed' : 'incomplete'
+    for (let index = 0; index < state.output.length; index++) {
+      const item = state.output[index]!
+      if (item.type === 'message') {
+        const content = (item.content as JsonObject[])[0]
+        if (content !== undefined) {
+          frames.push(responsesEvent(state, 'response.output_text.done', {
+            type: 'response.output_text.done', item_id: item.id, output_index: index, content_index: 0, text: content.text,
+          }))
+          frames.push(responsesEvent(state, 'response.content_part.done', {
+            type: 'response.content_part.done', item_id: item.id, output_index: index, content_index: 0,
+            part: { ...content },
+          }))
+        }
+        frames.push(responsesEvent(state, 'response.output_item.done', {
+          type: 'response.output_item.done', output_index: index, item: { ...item, status: itemStatus },
+        }))
+        item.status = itemStatus
+      } else if (item.type === 'reasoning') {
+        const summary = (item.summary as JsonObject[])[0]
+        frames.push(responsesEvent(state, 'response.reasoning_summary_text.done', {
+          type: 'response.reasoning_summary_text.done', item_id: item.id, output_index: index, summary_index: 0,
+          text: summary?.text ?? '',
+        }))
+        frames.push(responsesEvent(state, 'response.output_item.done', {
+          type: 'response.output_item.done', output_index: index, item: { ...item, status: itemStatus },
+        }))
+        item.status = itemStatus
+      } else if (item.type === 'function_call') {
+        frames.push(responsesEvent(state, 'response.function_call_arguments.done', {
+          type: 'response.function_call_arguments.done', item_id: item.id, output_index: index, arguments: item.arguments,
+        }))
+        frames.push(responsesEvent(state, 'response.output_item.done', {
+          type: 'response.output_item.done', output_index: index, item: { ...item, status: itemStatus },
+        }))
+        item.status = itemStatus
+      }
+    }
+    const response: JsonObject = {
+      id: state.responseId, object: 'response', status: terminalStatus,
+      model: ctx.model, output: state.output,
+    }
+    if (ctx.finish === 'length' || ctx.finish === 'content-filter') {
+      response.incomplete_details = { reason: ctx.finish === 'content-filter' ? 'content_filter' : 'max_output_tokens' }
+    }
+    if (ctx.usage !== undefined) {
+      response.usage = {
+        input_tokens: ctx.usage.promptTokens, output_tokens: ctx.usage.completionTokens,
+        total_tokens: ctx.usage.promptTokens + ctx.usage.completionTokens,
+        ...(ctx.usage.cachedTokens > 0 ? { input_tokens_details: { cached_tokens: ctx.usage.cachedTokens } } : {}),
+      }
+    }
+    if (ctx.finish === 'error') {
+      response.status = 'failed'
+      response.error = { code: 'server_error', message: state.error ?? 'upstream error' }
+      frames.push(responsesEvent(state, 'response.failed', { type: 'response.failed', response }))
+    } else {
+      frames.push(responsesEvent(state, 'response.completed', { type: 'response.completed', response }))
+    }
+    return frames
   },
 
-  /**
-   * 非流式响应体 → 规范事件。
-   *
-   * 非流式 Responses body 形状：`{output:[{type:'message',content:[{type:'output_text',text}]}
-   * |{type:'function_call',name,arguments}], status, usage:{input_tokens,output_tokens}}`。
-   * 与流式的 `response.output_item.added` / `response.completed` 共用同一组
-   * item→事件 映射，见 `outputItemEvents`。
-   */
   decodeJson(body) {
     const out: ChatEvent[] = []
     let index = 0
-    let text = ''
     for (const item of arr(body.output) ?? []) {
       const it = obj(item)
       if (it === undefined) continue
       if (it.type === 'message') {
-        for (const p of arr(it.content) ?? []) {
-          const t = str(obj(p)?.text)
-          if (t !== undefined) text += t
+        for (const part of arr(it.content) ?? []) {
+          const value = str(obj(part)?.text)
+          if (value !== undefined) out.push({ type: 'text', text: value })
         }
-        continue
-      }
-      if (it.type === 'function_call') {
-        out.push({ type: 'tool-start', index, name: str(it.name) ?? '' })
+      } else if (it.type === 'function_call') {
+        out.push({ type: 'tool-start', index, ...(str(it.call_id) === undefined ? {} : { id: str(it.call_id) }), name: str(it.name) ?? '' })
         out.push({ type: 'tool-args', index, delta: str(it.arguments) ?? '' })
         index += 1
-        continue
-      }
-      if (it.type === 'reasoning') {
-        for (const s of arr(it.summary) ?? []) {
-          const t = str(obj(s)?.text)
-          if (t !== undefined) out.push({ type: 'reasoning', text: t })
+      } else if (it.type === 'reasoning') {
+        for (const part of arr(it.summary) ?? []) {
+          const value = str(obj(part)?.text)
+          if (value !== undefined) out.push({ type: 'reasoning', text: value })
         }
       }
     }
-    if (text !== '') out.unshift({ type: 'text', text })
     const usage = obj(body.usage)
-    if (usage !== undefined) {
-      out.push({
-        type: 'usage',
-        promptTokens: num(usage.input_tokens) ?? 0,
-        completionTokens: num(usage.output_tokens) ?? 0,
-        cachedTokens: num(obj(usage.input_tokens_details)?.cached_tokens) ?? 0,
-      })
-    }
+    if (usage !== undefined) out.push({
+      type: 'usage', promptTokens: num(usage.input_tokens) ?? 0, completionTokens: num(usage.output_tokens) ?? 0,
+      cachedTokens: num(obj(usage.input_tokens_details)?.cached_tokens) ?? 0,
+    })
     const status = str(body.status)
-    if (status === 'incomplete') out.push({ type: 'finish', reason: 'length' })
-    else if (status === 'failed') out.push({ type: 'finish', reason: 'error' })
-    else out.push({ type: 'finish', reason: 'stop' })
+    const incompleteReason = str(obj(body.incomplete_details)?.reason)
+    if (status === 'failed' || status === 'cancelled' || status === 'canceled') {
+      const error = obj(body.error)
+      const message = str(error?.message) ?? `upstream response ${status}`
+      out.push({ type: 'error', message }, { type: 'finish', reason: 'error' })
+    } else if (status === 'incomplete') {
+      if (incompleteReason !== undefined && incompleteReason !== 'max_output_tokens' && incompleteReason !== 'content_filter') {
+        out.push({ type: 'error', message: `unknown incomplete reason: ${incompleteReason}` }, { type: 'finish', reason: 'error' })
+      } else {
+        out.push({ type: 'finish', reason: incompleteReason === 'content_filter' ? 'content-filter' : 'length' })
+      }
+    } else if (status === 'completed') {
+      out.push({ type: 'finish', reason: outputHasToolCall(body.output) ? 'tool-calls' : 'stop' })
+    } else {
+      out.push({ type: 'error', message: `unknown response status: ${status ?? 'missing'}` }, { type: 'finish', reason: 'error' })
+    }
     return out
   },
+}
 
-  /** 规范事件 → 非流式 body。 */
-  encodeJson(events, ctx) {
-    const output: JsonObject[] = []
-    let status = 'completed'
-    let usage = { input: 0, output: 0 }
-    for (const ev of events) {
-      switch (ev.type) {
-        case 'text':
-          if (output.length > 0 && output[output.length - 1]?.type === 'message') {
-            const c = (output[output.length - 1] as JsonObject).content as JsonObject[]
-            if (c.length > 0 && c[c.length - 1]?.type === 'output_text') {
-              ;(c[c.length - 1] as JsonObject).text += ev.text
-              break
-            }
-            c.push({ type: 'output_text', text: ev.text })
-            break
-          }
-          output.push({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: ev.text }] })
-          break
-        case 'reasoning': {
-          const last = output[output.length - 1]
-          if (last?.type === 'reasoning') {
-            ;((last.summary as JsonObject[])[0] as JsonObject).text += ev.text
-          } else {
-            output.push({ type: 'reasoning', summary: [{ type: 'summary_text', text: ev.text }] })
-          }
-          break
-        }
-        case 'tool-start':
-          output.push({ type: 'function_call', id: ev.id ?? `fc_${ev.index}`, call_id: ev.id ?? `call_${ev.index}`, name: ev.name ?? '', arguments: '' })
-          break
-        case 'tool-args': {
-          const last = output[output.length - 1]
-          if (last?.type === 'function_call') last.arguments += ev.delta
-          break
-        }
-        case 'finish':
-          if (ev.reason === 'length') status = 'incomplete'
-          else if (ev.reason === 'error') status = 'failed'
-          break
-        case 'usage': usage = { input: ev.promptTokens, output: ev.completionTokens }; break
-        case 'error': break
-      }
-    }
-    return {
-      id: `resp_${Date.now().toString(36)}`,
-      object: 'response',
-      status,
-      model: ctx.model,
-      output,
-      usage: { input_tokens: usage.input, output_tokens: usage.output, total_tokens: usage.input + usage.output },
-    }
-  },
+interface ResponsesEncodingState {
+  responseId: string
+  sequence: number
+  output: JsonObject[]
+  toolIndexes: Record<string, number>
+  decodedToolIndexes: Record<string, number>
+  nextDecodedToolIndex: number
+  error?: string
+}
+
+function newResponsesState(): ResponsesEncodingState {
+  return {
+    responseId: `resp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`,
+    sequence: 0,
+    output: [],
+    toolIndexes: Object.create(null) as Record<string, number>,
+    decodedToolIndexes: Object.create(null) as Record<string, number>,
+    nextDecodedToolIndex: 0,
+  }
+}
+
+function responsesSession(session?: { state?: unknown }): ResponsesEncodingState {
+  const value = session?.state
+  if (value !== null && typeof value === 'object' && 'responseId' in value && 'output' in value && 'toolIndexes' in value) {
+    const state = value as ResponsesEncodingState
+    state.decodedToolIndexes ??= Object.create(null) as Record<string, number>
+    state.nextDecodedToolIndex ??= Object.keys(state.decodedToolIndexes).length
+    return state
+  }
+  return newResponsesState()
+}
+
+function responsesEvent(state: ResponsesEncodingState, event: string, payload: JsonObject): string {
+  payload.sequence_number = state.sequence++
+  return eventFrame(event, JSON.stringify(payload))
+}
+
+function ensureResponsesMessage(state: ResponsesEncodingState): { index: number; item: JsonObject; added: boolean } {
+  const lastIndex = state.output.length - 1
+  const last = state.output[lastIndex]
+  if (last?.type === 'message') return { index: lastIndex, item: last, added: false }
+  const item: JsonObject = {
+    id: `msg_${state.responseId}_${state.output.length}`, type: 'message', status: 'in_progress', role: 'assistant',
+    content: [{ type: 'output_text', text: '', annotations: [] }],
+  }
+  state.output.push(item)
+  return { index: state.output.length - 1, item, added: true }
+}
+
+function ensureResponsesReasoning(state: ResponsesEncodingState): { index: number; item: JsonObject; added: boolean } {
+  const lastIndex = state.output.length - 1
+  const last = state.output[lastIndex]
+  if (last?.type === 'reasoning') return { index: lastIndex, item: last, added: false }
+  const item: JsonObject = {
+    id: `rs_${state.responseId}_${state.output.length}`, type: 'reasoning', status: 'in_progress',
+    summary: [{ type: 'summary_text', text: '' }],
+  }
+  state.output.push(item)
+  return { index: state.output.length - 1, item, added: true }
+}
+
+function appendResponsesText(item: JsonObject, text: string): void {
+  const content = item.content as JsonObject[]
+  if (content.length === 0) content.push({ type: 'output_text', text: '', annotations: [] })
+  content[0]!.text = String(content[0]!.text ?? '') + text
 }
 
 /* ------------------------------------------------------------------ */
@@ -397,6 +553,36 @@ function inputItem(item: unknown): JsonObject | undefined {
     return { role: 'tool', tool_call_id: str(it.call_id) ?? '', content: str(it.output) ?? '' }
   }
   return undefined
+}
+
+/** Chat message content → Responses message content, retaining input images. */
+function responsesMessageContent(content: unknown, role: 'assistant' | 'user'): string | JsonObject[] {
+  if (typeof content === 'string') return content
+  const out: JsonObject[] = []
+  for (const raw of arr(content) ?? []) {
+    const part = obj(raw)
+    if (part === undefined) continue
+    const type = str(part.type)
+    if (type === 'text' || type === 'input_text' || type === 'output_text') {
+      const text = str(part.text)
+      if (text !== undefined) out.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text })
+      continue
+    }
+    if (role === 'user' && type === 'image_url') {
+      const image = part.image_url
+      const imageObject = obj(image)
+      const url = typeof image === 'string' ? image : str(imageObject?.url)
+      if (url !== undefined && url !== '') {
+        const detail = str(imageObject?.detail)
+        out.push({
+          type: 'input_image',
+          image_url: url,
+          ...(detail === undefined ? {} : { detail }),
+        })
+      }
+    }
+  }
+  return out
 }
 
 /** Chat 的 content（字符串或 parts）→ 纯文本。 */
@@ -459,19 +645,26 @@ function chatToolToResponses(t: unknown): JsonObject | undefined {
 /* ------------------------------------------------------------------ */
 
 /** `response.output_item.added`：函数调用项给出名字。 */
-function outputItemEvents(payload: JsonObject): ChatEvent[] {
+function outputItemEvents(payload: JsonObject, state: ResponsesEncodingState): ChatEvent[] {
   const item = obj(payload.item)
-  if (item === undefined || item.type !== 'function_call') return []
+  const outputIndex = num(payload.output_index)
+  if (item === undefined || item.type !== 'function_call' || outputIndex === undefined) return []
+  const key = String(outputIndex)
+  let chatIndex = state.decodedToolIndexes[key]
+  if (chatIndex === undefined) {
+    chatIndex = state.nextDecodedToolIndex++
+    state.decodedToolIndexes[key] = chatIndex
+  }
   return [{
     type: 'tool-start',
-    index: num(payload.output_index) ?? 0,
-    ...(str(item.id) === undefined ? {} : { id: str(item.id) }),
+    index: chatIndex,
+    ...(str(item.call_id) === undefined ? {} : { id: str(item.call_id) }),
     name: str(item.name) ?? '',
   }]
 }
 
 /** `response.completed`：收尾 + 用量都在这帧。 */
-function completedEvents(payload: JsonObject): ChatEvent[] {
+function completedEvents(payload: JsonObject, state: ResponsesEncodingState): ChatEvent[] {
   const response = obj(payload.response)
   const out: ChatEvent[] = []
   const usage = obj(response?.usage)
@@ -484,17 +677,28 @@ function completedEvents(payload: JsonObject): ChatEvent[] {
     })
   }
   const status = str(response?.status)
-  if (status === 'failed') {
+  if (status === 'failed' || status === 'cancelled' || status === 'canceled') {
+    const error = obj(response?.error)
+    state.error = str(error?.message) ?? `upstream response ${status}`
     out.push({ type: 'finish', reason: 'error' })
   } else if (status === 'incomplete') {
     // `incomplete_details.reason` 只可能是 `max_output_tokens` / `content_filter`。
     // 别看 `status` 本身：`incomplete` 不等于截断，content_filter 也是 incomplete。
-    out.push({ type: 'finish', reason: finishOf(str(obj(response?.incomplete_details)?.reason)) })
-  } else {
+    const reason = str(obj(response?.incomplete_details)?.reason)
+    if (reason !== undefined && reason !== 'max_output_tokens' && reason !== 'content_filter') {
+      state.error = `unknown incomplete reason: ${reason}`
+      out.push({ type: 'finish', reason: 'error' })
+    } else {
+      out.push({ type: 'finish', reason: finishOf(reason) })
+    }
+  } else if (status === 'completed') {
     // `status:'completed'` 本身**不带**收尾原因（Responses 没有 finish_reason
     // 字段），真原因是 output 里有没有 function_call：有就是 tool-calls。
     // 读不到 output 时按 stop —— 这是 Responses 语义上的「正常说完」。
     out.push({ type: 'finish', reason: outputHasToolCall(response?.output) ? 'tool-calls' : 'stop' })
+  } else {
+    state.error = `unknown response status: ${status ?? 'missing'}`
+    out.push({ type: 'finish', reason: 'error' })
   }
   return out
 }

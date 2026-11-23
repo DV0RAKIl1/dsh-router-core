@@ -15,10 +15,11 @@
  */
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import type { ChatRequest, ModelInfo } from '../../router/types.ts'
-import type { AccountState, ChatOnceResult, SupplierStatusNow } from '../contract.ts'
+import type { ChatRequest, ModelInfo, ResponsesRequest } from '../../router/types.ts'
+import type { AccountState, ChatOnceResult, ResponsesOnceResult, SupplierStatusNow } from '../contract.ts'
 import type { SupplierEnv, SupplierModule } from '../contract.ts'
 import { stateFromHttpStatus } from '../http-state.ts'
+import { nativeResponsesBody, requestNativeResponses } from '../responses-http.ts'
 
 export const id = 'nvidia'
 export const name = 'NVIDIA NIM'
@@ -305,6 +306,30 @@ export default function factory(env: SupplierEnv): SupplierModule {
         return { ok: false, state: 'transport', message: msg }
       }
       return { ok: true, status: upstream.status, body: text }
+    },
+    /** Native Responses path: no model-specific capability gate; preserve raw Responses output. */
+    async responsesOnce(uid: string, _lv: string, req: ResponsesRequest): Promise<ResponsesOnceResult> {
+      const acct = getKey(uid)
+      if (acct === undefined) {
+        const msg = `unknown account ${JSON.stringify(uid)}`
+        return { ok: false, state: 'no_such_model', message: msg }
+      }
+      const base = stripAlias(req.model, currentAlias())
+      let body: string
+      try {
+        body = nativeResponsesBody(req, base)
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error)
+        return { ok: false, state: 'bad_request', message: `invalid Responses request: ${msg}` }
+      }
+      return requestNativeResponses(
+        `${BASE}/responses`,
+        { Authorization: `Bearer ${acct.apiKey}`, 'User-Agent': 'dsh-router' },
+        body,
+        req,
+        'nvidia',
+        stateFromHttpStatus,
+      )
     },
     dispose: (): void => {
       modelsCache = undefined

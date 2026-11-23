@@ -6,8 +6,8 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { ServerResponse } from 'node:http'
-import type { Supplier, ChatRequest, ModelInfo, ModelWithEnabled, SupplierStatus, Combo } from './types.ts'
-import type { ChatOnceResult } from '../suppliers/contract.ts'
+import type { Supplier, ChatRequest, ResponsesRequest, ModelInfo, ModelWithEnabled, SupplierStatus, Combo } from './types.ts'
+import type { ChatOnceResult, ResponsesOnceResult } from '../suppliers/contract.ts'
 import type { AccountState } from '../suppliers/contract.ts'
 import { AccountPool } from './account-pool.ts'
 import { SupplierConfigStore } from '../supplier-config.ts'
@@ -16,6 +16,8 @@ import { tapStreamUsage, usageFromJsonBody, withEstimates, type UsageTokens } fr
 import { codecOf } from '../protocol/index.ts'
 import { StreamState, translateStream } from '../protocol/stream.ts'
 import type { JsonObject } from '../protocol/types.ts'
+import { responsesToChatCompatible } from '../protocol/responses-compat.ts'
+import { outboundSink } from '../protocol/entry.ts'
 
 /** 一次 chat 的追踪信息（记日志用，回答「到底用的哪个模型哪个号」）。 */
 interface ChatTrace {
@@ -27,6 +29,10 @@ interface ChatTrace {
   lastError?: string
   /** 最后一次失败的状态（组合据此判断要不要「喘口气」再降级）。 */
   lastState?: AccountState
+  /** Request-level validation failure for this candidate's compatibility path. */
+  compatibilityError?: string
+  /** This candidate can represent and accept the request, independent of availability. */
+  requestSupported?: boolean
   /** 本次选号的理由（诊断「为什么没粘住原号」）。 */
   pickWhy?: string
 }
@@ -193,6 +199,83 @@ function reqMessages(rawBody: string): unknown {
   }
 }
 
+function reqResponsesInput(rawBody: string): unknown {
+  try {
+    return (JSON.parse(rawBody) as { input?: unknown }).input
+  } catch {
+    return undefined
+  }
+}
+
+/** Read a native Responses SSE stream and return only its completed response object. */
+async function aggregateResponsesSSE(stream: ReadableStream<Uint8Array>, signal?: AbortSignal): Promise<string> {
+  const reader = stream.getReader()
+  const onAbort = (): void => { void reader.cancel(signal?.reason).catch(() => {}) }
+  if (signal?.aborted) onAbort()
+  else signal?.addEventListener('abort', onAbort, { once: true })
+  const dec = new TextDecoder()
+  let buf = ''
+  let pendingCR = false
+  const normalizeLineEndings = (chunk: string, final = false): string => {
+    let text = (pendingCR ? '\r' : '') + chunk
+    pendingCR = false
+    if (!final && text.endsWith('\r')) {
+      pendingCR = true
+      text = text.slice(0, -1)
+    }
+    return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  }
+  let event = ''
+  let data: string[] = []
+  let completed: Record<string, unknown> | undefined
+
+  const parseFrame = (frame: string): void => {
+    event = ''
+    data = []
+    for (const line of frame.split('\n')) {
+      if (line.startsWith('event:')) event = line.slice(6).trim()
+      else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''))
+    }
+    const payload = data.join('\n')
+    const item = payload === '' || payload === '[DONE]'
+      ? undefined
+      : (() => { try { return JSON.parse(payload) as Record<string, unknown> } catch { return undefined } })()
+    const type = typeof item?.type === 'string' ? item.type : event
+    if (type === 'response.failed' || type === 'response.incomplete' || type === 'error') {
+      completed = undefined
+      return
+    }
+    if (type !== 'response.completed' && type !== 'response.done') return
+    completed = undefined
+    const response = item?.response
+    if (response === null || typeof response !== 'object' || Array.isArray(response)) return
+    const candidate = response as Record<string, unknown>
+    if (candidate.status !== 'completed') return
+    completed = candidate
+  }
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += normalizeLineEndings(dec.decode(value, { stream: true }))
+      let boundary = buf.indexOf('\n\n')
+      while (boundary !== -1) {
+        parseFrame(buf.slice(0, boundary))
+        buf = buf.slice(boundary + 2)
+        boundary = buf.indexOf('\n\n')
+      }
+    }
+    buf += normalizeLineEndings(dec.decode(), true)
+    if (buf !== '') parseFrame(buf)
+  } finally {
+    signal?.removeEventListener('abort', onAbort)
+    try { reader.releaseLock() } catch { /* a pending read may keep the lock */ }
+  }
+  if (completed === undefined) throw new Error('Responses SSE ended without response.completed')
+  return JSON.stringify(completed)
+}
+
 /** 丢弃响应的假 ServerResponse（测试模型用：记录状态+内容，用于判定成败）。 */
 /**
  * 响应收集器：把 Router 本来要写给 `res` 的东西收进来，让调用方翻译后自己写。
@@ -220,31 +303,49 @@ export interface ResponseSink {
 }
 
 /** 把 ResponseSink 包成一个 Router 能写的 ServerResponse。 */
-function sinkRes(sink: ResponseSink): ServerResponse {
+function sinkRes(sink: ResponseSink, underlying?: ServerResponse): ServerResponse {
+  let headersSent = false
+  let writableEnded = false
+  let destroyed = false
   const self = {
-    headersSent: false,
-    writableEnded: false,
-    destroyed: false,
+    get headersSent() { return underlying?.headersSent ?? headersSent },
+    get writableEnded() { return underlying?.writableEnded ?? writableEnded },
+    get destroyed() { return underlying?.destroyed ?? destroyed },
     writeHead: (code: number, headers?: Record<string, string>): unknown => {
+      headersSent = true
       sink.head?.(code, headers ?? {})
       return self
     },
     write: (chunk?: unknown): boolean => {
       if (chunk !== undefined) {
+        headersSent = true
         sink.write(typeof chunk === 'string' ? new TextEncoder().encode(chunk) : (chunk as Uint8Array))
       }
       return true
     },
     end: (chunk?: unknown): unknown => {
       if (chunk !== undefined) self.write(chunk)
+      writableEnded = true
       sink.end()
       return self
     },
     flushHeaders: (): void => {},
-    once: (): unknown => self,
-    on: (): unknown => self,
-    removeListener: (): unknown => self,
-    destroy: (): void => { self.destroyed = true },
+    once: (event: string, listener: (...args: never[]) => void): unknown => {
+      if (underlying !== undefined) underlying.once(event, listener as (...args: never[]) => void)
+      return self
+    },
+    on: (event: string, listener: (...args: never[]) => void): unknown => {
+      if (underlying !== undefined) underlying.on(event, listener as (...args: never[]) => void)
+      return self
+    },
+    removeListener: (event: string, listener: (...args: never[]) => void): unknown => {
+      if (underlying !== undefined) underlying.removeListener(event, listener as (...args: never[]) => void)
+      return self
+    },
+    destroy: (): void => {
+      destroyed = true
+      if (underlying !== undefined) underlying.destroy()
+    },
     setHeader: (): unknown => self,
     removeHeader: (): unknown => self,
     writeableEnded: false,
@@ -261,7 +362,7 @@ function sinkRes(sink: ResponseSink): ServerResponse {
  * 而名字藏在 SSE 的 `delta` 里，解析结果就是 name 为空（下游报
  * `unknown tool ""`）。这是协议错配，不是丢数据。
  */
-async function aggregateSSE(stream: ReadableStream<Uint8Array>): Promise<string> {
+async function aggregateSSE(stream: ReadableStream<Uint8Array>, signal?: AbortSignal): Promise<string> {
   const dec = new TextDecoder()
   let id = ''
   let model = ''
@@ -274,6 +375,9 @@ async function aggregateSSE(stream: ReadableStream<Uint8Array>): Promise<string>
   const calls = new Map<number, { id?: string; type?: string; name: string; args: string }>()
 
   const reader = stream.getReader()
+  const onAbort = (): void => { void reader.cancel(signal?.reason).catch(() => {}) }
+  if (signal?.aborted) onAbort()
+  else signal?.addEventListener('abort', onAbort, { once: true })
   let buf = ''
   try {
   for (;;) {
@@ -326,6 +430,7 @@ async function aggregateSSE(stream: ReadableStream<Uint8Array>): Promise<string>
     }
   }
   } finally {
+    signal?.removeEventListener('abort', onAbort)
     // 无论正常读完还是中途抛错，都要**解绑** reader：调用方（writeChatResult）
     // 在失败路径里要对同一流 cancel()，而流被锁住时 cancel 会抛
     // `Invalid state: ReadableStream is locked` —— 那样这次的连接就漏了。
@@ -499,9 +604,11 @@ async function writeChatResult(
   probe?: UsageProbe,
   startedAt = 0,
   firstByteTimeoutMs = FIRST_BYTE_BUDGET_MS,
+  signal?: AbortSignal,
 ): Promise<boolean> {
-  if (!r.ok) return false // 失败不该走到这里（核心先判 ok 才写）
+  if (!r.ok || signal?.aborted) return false // 失败或请求已取消时不写响应
   if (!('stream' in r)) {
+    if (signal?.aborted) return false
     if (probe !== undefined) probe.tokens = usageFromJsonBody(r.body)
     res.writeHead(r.status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
     res.end(r.body)
@@ -515,7 +622,7 @@ async function writeChatResult(
   if (!wantsStream) {
     let body: string
     try {
-      body = await aggregateSSE(src)
+      body = await aggregateSSE(src, signal)
     } catch {
       // 聚合失败 = 一个字节都没写，调用方可以换号重试。
       // **但底层流必须 cancel**：aggregateSSE 内部 getReader() 消费到一半抛错时，
@@ -524,6 +631,7 @@ async function writeChatResult(
       await src.cancel().catch(() => {})
       return false
     }
+    if (signal?.aborted) return false
     if (probe !== undefined) probe.tokens = usageFromJsonBody(body)
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
     res.end(body)
@@ -547,6 +655,13 @@ async function writeChatResult(
    * abort 才能让 pipeTo 立刻收尾并走它的取消路径（进而 cancel 上游）。
    */
   const abort = new AbortController()
+  const onRequestAbort = (): void => {
+    dead = true
+    releaseWait?.()
+    abort.abort(signal?.reason)
+  }
+  if (signal?.aborted) onRequestAbort()
+  else signal?.addEventListener('abort', onRequestAbort, { once: true })
   const writeChunk = (chunk: Uint8Array): Promise<void> =>
     new Promise<void>((resolve) => {
       if (dead) { resolve(); return }
@@ -602,6 +717,7 @@ async function writeChatResult(
   } catch {
     // 断流/取消：一个字节都没写的话，调用方还能换号重试——交给上层决定
   } finally {
+    signal?.removeEventListener('abort', onRequestAbort)
     res.removeListener('error', onError)
     res.removeListener('close', onClose)
     // 断流也要给客户端一个终止帧。客户端（dsh-llm adapter）严格等
@@ -627,8 +743,132 @@ async function writeChatResult(
   return wroteAny
 }
 
+/** Write native Responses without Chat frame normalization or synthetic [DONE]. */
+function cancelUnwrittenResponsesStream(result: ResponsesOnceResult, reason: unknown): void {
+  if (result.ok && 'stream' in result) void result.stream.cancel(reason).catch(() => {})
+}
+
+async function writeResponsesResult(
+  res: ServerResponse,
+  result: ResponsesOnceResult,
+  wantsStream: boolean,
+  probe?: UsageProbe,
+  startedAt = 0,
+  firstByteTimeoutMs = FIRST_BYTE_BUDGET_MS,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!result.ok) return false
+  if (!('stream' in result)) {
+    if (probe !== undefined) probe.tokens = usageFromJsonBody(result.body)
+    if (!wantsStream) {
+      res.writeHead(result.status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+      res.end(result.body)
+      return true
+    }
+    let response: unknown
+    try { response = JSON.parse(result.body) } catch { return false }
+    if (result.status < 200 || result.status >= 300) {
+      res.writeHead(result.status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+      res.end(result.body)
+      return true
+    }
+    if (response === null || typeof response !== 'object' || Array.isArray(response)) return false
+    const completed = response as Record<string, unknown>
+    if (completed.status !== 'completed' || 'error' in completed) return false
+    const frame = `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response })}\n\n`
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' })
+    res.end(frame)
+    return true
+  }
+
+  const src = withFirstByteDeadline(result.stream, firstByteTimeoutMs)
+  const tapped = tapStreamUsage(src, startedAt, { propagateErrors: true })
+  if (!wantsStream) {
+    let body: string
+    try {
+      body = await aggregateResponsesSSE(tapped.stream, signal)
+    } catch {
+      await tapped.stream.cancel().catch(() => {})
+      return false
+    }
+    const got = await tapped.done()
+    if (probe !== undefined) {
+      probe.tokens = got.usage
+      probe.outputChars = got.outputChars
+      probe.ttfbMs = got.ttfbMs
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+    res.end(body)
+    return true
+  }
+
+  let wroteAny = false
+  let dead = false
+  let sourceFailed = false
+  let releaseWait: (() => void) | undefined
+  const abort = new AbortController()
+  const writeChunk = (chunk: Uint8Array): Promise<void> => new Promise<void>((resolve) => {
+    if (dead) { resolve(); return }
+    if (!wroteAny) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      })
+      if (typeof (res as { flushHeaders?: () => void }).flushHeaders === 'function') {
+        ;(res as { flushHeaders: () => void }).flushHeaders()
+      }
+      wroteAny = true
+    }
+    if (res.write(chunk)) resolve()
+    else {
+      const onDrain = (): void => { res.removeListener('error', onDrain); resolve() }
+      res.once('drain', onDrain)
+      releaseWait = () => { res.removeListener('drain', onDrain); resolve() }
+    }
+  })
+  const onError = (): void => { dead = true; res.destroy() }
+  const onClose = (): void => {
+    if (res.writableEnded) return
+    dead = true
+    releaseWait?.()
+    abort.abort()
+  }
+  const onRequestAbort = (): void => {
+    dead = true
+    releaseWait?.()
+    abort.abort(signal?.reason)
+  }
+  if (signal?.aborted) onRequestAbort()
+  else signal?.addEventListener('abort', onRequestAbort, { once: true })
+  res.once('error', onError)
+  res.once('close', onClose)
+  try {
+    await tapped.stream.pipeTo(new WritableStream<Uint8Array>({ write: writeChunk }), { signal: abort.signal })
+  } catch {
+    if (!dead) sourceFailed = true
+  } finally {
+    signal?.removeEventListener('abort', onRequestAbort)
+    res.removeListener('error', onError)
+    res.removeListener('close', onClose)
+    if (wroteAny && !dead && !res.writableEnded && !res.destroyed) {
+      if (sourceFailed) res.destroy()
+      else res.end()
+    }
+    if (probe !== undefined) {
+      const got = await tapped.done()
+      probe.tokens = got.usage
+      probe.outputChars = got.outputChars
+      probe.ttfbMs = got.ttfbMs
+    }
+  }
+  // After committing any bytes the route must never retry on the same HTTP response.
+  return wroteAny
+}
+
 /** SSE 终止帧（断流兜底补发用）。 */
-const DONE_FRAME = new TextEncoder().encode('data: [DONE]\n\n')
+const DONE_FRAME = new TextEncoder().encode('data: [DONE]\\n\\n')
 
 /**
  * 取该供应商的 `chatOnce`，按它声明的 wire 包一层协议翻译。
@@ -1168,6 +1408,370 @@ export class Router {
     return this.customCombos.find((c) => c.name === name)
   }
 
+  /** Native Responses route: preserve the Responses payload and SSE protocol end-to-end. */
+  async responses(req: ResponsesRequest, res: ServerResponse): Promise<void> {
+    const probe: UsageProbe = {
+      requested: req.model,
+      supplier: '',
+      model: '',
+      uid: '',
+      tokens: null,
+      outputChars: 0,
+      ttfbMs: 0,
+      startedAt: Date.now(),
+    }
+    const settle = (ok: boolean, error?: string): void => {
+      const usage = ok
+        ? withEstimates(probe.tokens, req.rawBody.length, probe.outputChars)
+        : { promptTokens: 0, completionTokens: 0, cachedTokens: 0, inputEstimated: false, outputEstimated: false }
+      this.usage.record({
+        supplier: probe.supplier,
+        model: probe.model,
+        requested: probe.requested,
+        ok,
+        durationMs: Date.now() - probe.startedAt,
+        ttfbMs: probe.ttfbMs,
+        ...(ok && probe.uid !== '' ? { uid: probe.uid } : {}),
+        ...(req.session === undefined ? {} : { session: req.session }),
+        ...(error === undefined ? {} : { error }),
+      }, usage)
+    }
+    const clientGone = (): boolean => req.signal?.aborted === true || res.destroyed || res.writableEnded
+    let parsedBody: JsonObject
+    try {
+      const value: unknown = JSON.parse(req.rawBody)
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('body must be an object')
+      parsedBody = value as JsonObject
+    } catch {
+      settle(false, 'invalid Responses JSON body')
+      writeJson(res, 400, openAIError('invalid_request', 'Responses body must be a JSON object'))
+      return
+    }
+
+    const combo = this.comboByName(req.model)
+    if (combo !== undefined) {
+      let compatibilityError: string | undefined
+      let requestSupported = false
+      for (let i = 0; i < combo.models.length; i++) {
+        const target = combo.models[i]
+        if (target === undefined) continue
+        const trace: ChatTrace = { attempts: 0 }
+        const served = await this.responsesWithModel(
+          req, res, target, probe, trace, Date.now() + this.firstByteBudgetMs,
+        )
+        if (served) {
+          settle(true)
+          return
+        }
+        if (clientGone()) {
+          settle(false, 'Responses request aborted')
+          return
+        }
+        if (trace.requestSupported === true) requestSupported = true
+        if (trace.compatibilityError !== undefined) compatibilityError = trace.compatibilityError
+        if (res.headersSent) {
+          settle(false, 'native Responses writer failed after response commitment')
+          return
+        }
+        if (trace.lastState !== undefined && isTransient(trace.lastState) && i < combo.models.length - 1) {
+          await new Promise((resolve) => setTimeout(resolve, TRANSIENT_SETTLE_MS))
+        }
+      }
+      if (!requestSupported && compatibilityError !== undefined) {
+        settle(false, compatibilityError)
+        writeJson(res, 400, openAIError('unsupported_parameter', compatibilityError))
+        return
+      }
+      settle(false, 'combo: all native Responses models unavailable')
+      if (!clientGone() && !res.headersSent) {
+        writeJson(res, 503, openAIError('no_healthy_supplier', `combo ${JSON.stringify(req.model)}: no Responses-capable supplier available`))
+      }
+      return
+    }
+
+    const slash = req.model.indexOf('/')
+    const alias = slash > 0 ? req.model.slice(0, slash) : ''
+    const target = alias === '' ? undefined : this.supplierByAlias(alias)
+    const directTrace: ChatTrace = { attempts: 0 }
+    const served = target === undefined
+      ? await this.responsesWithModel(req, res, req.model, probe, directTrace)
+      : await this.responsesWithModel(req, res, `${target.id},${req.model}`, probe, directTrace)
+    if (served) {
+      settle(true)
+      return
+    }
+    if (clientGone()) {
+      settle(false, 'Responses request aborted')
+      return
+    }
+    if (directTrace.compatibilityError !== undefined) {
+      settle(false, directTrace.compatibilityError)
+      writeJson(res, 400, openAIError('unsupported_parameter', directTrace.compatibilityError))
+      return
+    }
+    if (res.headersSent) {
+      settle(false, 'native Responses writer failed after response commitment')
+      return
+    }
+    settle(false, target === undefined ? 'no native Responses supplier matched model' : `supplier ${target.id}: native Responses unavailable`)
+    if (!clientGone() && !res.headersSent) {
+      writeJson(res, 503, openAIError('no_healthy_supplier', target === undefined
+        ? 'no native Responses supplier matched model'
+        : `supplier ${JSON.stringify(target.id)} does not support native Responses or has no healthy accounts`))
+    }
+  }
+
+  private async responsesWithChatSupplier(
+    req: ResponsesRequest,
+    res: ServerResponse,
+    supplier: Supplier,
+    model: string,
+    probe: UsageProbe,
+    trace: ChatTrace,
+    firstByteDeadlineAt: number,
+  ): Promise<boolean> {
+    let body: JsonObject
+    try {
+      const value: unknown = JSON.parse(req.rawBody)
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('body must be a JSON object')
+      body = value as JsonObject
+    } catch {
+      trace.compatibilityError = 'Responses body must be a JSON object'
+      return false
+    }
+    const converted = responsesToChatCompatible(body, model, req.stream)
+    if (!converted.ok) {
+      trace.compatibilityError = converted.error
+      return false
+    }
+    const chatReq: ChatRequest = {
+      rawBody: JSON.stringify(converted.body),
+      stream: req.stream,
+      model,
+      ...(req.lv === undefined ? {} : { lv: req.lv }),
+      ...(req.session === undefined ? {} : { session: req.session }),
+      ...(req.signal === undefined ? {} : { signal: req.signal }),
+    }
+    // Reuse the supplier-scoped Chat account pool, but translate its response directly
+    // to Responses JSON/SSE. The normal Chat endpoint remains on its existing writer.
+    trace.requestSupported = true
+    const responseSink = outboundSink('responses', req.model, res)
+    return await this.chatWithSupplier(
+      supplier, chatReq, sinkRes(responseSink, res), trace, probe, firstByteDeadlineAt,
+    )
+  }
+
+  private async responsesWithModel(
+    req: ResponsesRequest,
+    res: ServerResponse,
+    model: string,
+    probe: UsageProbe,
+    trace: ChatTrace = { attempts: 0 },
+    firstByteDeadlineAt = Date.now() + this.firstByteBudgetMs,
+  ): Promise<boolean> {
+    const comma = model.indexOf(',')
+    if (comma <= 0) {
+      trace.lastState = 'no_such_model'
+      trace.lastError = `model ${JSON.stringify(model)} is missing supplierId prefix`
+      return false
+    }
+    const supplierId = model.slice(0, comma)
+    const modelId = model.slice(comma + 1)
+    const s = this.active.find((item) => item.id === supplierId)
+    if (s === undefined) {
+      trace.lastState = 'no_such_model'
+      trace.lastError = `unknown supplier ${supplierId}`
+      return false
+    }
+    // Native Responses is selected whenever the supplier exposes responsesOnce. The
+    // compatibility path is only for suppliers that have no native implementation.
+    if (s.responsesOnce === undefined) {
+      return await this.responsesWithChatSupplier(req, res, s, modelId, probe, trace, firstByteDeadlineAt)
+    }
+    trace.requestSupported = true
+    // Match the existing Chat contract: the selected Responses model remains alias-qualified;
+    // supplier code owns stripping its own alias before the upstream request.
+    const providerModel = modelId
+    let rawBody = req.rawBody
+    try {
+      const body = JSON.parse(req.rawBody) as Record<string, unknown>
+      if (body !== null && typeof body === 'object' && !Array.isArray(body)) {
+        body.model = providerModel
+        rawBody = JSON.stringify(body)
+      }
+    } catch {
+      trace.lastState = 'bad_request'
+      trace.lastError = 'invalid JSON body'
+      return false
+    }
+    const nativeReq: ResponsesRequest = { ...req, rawBody, model: providerModel }
+    const pool = s.pool
+    const cfg = this.store.get(s.id)
+    const accountList = s.accounts()
+
+    const statModel = stripAlias(providerModel, s.getAlias())
+    const recordModel = (): void => {
+      probe.supplier = s.id
+      probe.model = `${s.getAlias()}/${statModel}`
+    }
+    const callOnce = async (uid: string): Promise<ResponsesOnceResult> => {
+      const controller = new AbortController()
+      const remaining = firstByteDeadlineAt - Date.now()
+      const timeoutReason = new Error('first-byte budget exhausted')
+      let timeout: ReturnType<typeof setTimeout> | undefined
+      let resolveAborted: ((result: ResponsesOnceResult) => void) | undefined
+      const aborted = new Promise<ResponsesOnceResult>((resolve) => { resolveAborted = resolve })
+      const onAbort = (): void => {
+        const reason = controller.signal.reason
+        resolveAborted?.({
+          ok: false,
+          state: 'transport',
+          message: reason instanceof Error ? reason.message : 'Responses request aborted',
+        })
+      }
+      const onRequestAbort = (): void => controller.abort(req.signal?.reason ?? new Error('request aborted'))
+      const onClientClose = (): void => {
+        if (!res.writableEnded) controller.abort(new Error('client disconnected'))
+      }
+      controller.signal.addEventListener('abort', onAbort, { once: true })
+      if (req.signal?.aborted) onRequestAbort()
+      else req.signal?.addEventListener('abort', onRequestAbort, { once: true })
+      if (res.destroyed || res.writableEnded) onClientClose()
+      else res.once('close', onClientClose)
+      if (!controller.signal.aborted) {
+        if (remaining <= 0) controller.abort(timeoutReason)
+        else timeout = setTimeout(() => controller.abort(timeoutReason), remaining)
+      }
+
+      const pending = Promise.resolve().then(() => {
+        if (controller.signal.aborted) {
+          const reason = controller.signal.reason
+          return {
+            ok: false as const,
+            state: 'transport' as const,
+            message: reason instanceof Error ? reason.message : 'Responses request aborted',
+          }
+        }
+        return s.responsesOnce!(uid, req.lv ?? 'auto', { ...nativeReq, signal: controller.signal })
+      })
+      void pending.then((lateResult) => {
+        if (controller.signal.aborted && lateResult.ok && 'stream' in lateResult) {
+          void lateResult.stream.cancel(controller.signal.reason).catch(() => {})
+        }
+      }, () => {})
+      try {
+        return await Promise.race([pending, aborted])
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { ok: false, state: 'transport', message }
+      } finally {
+        if (timeout !== undefined) clearTimeout(timeout)
+        controller.signal.removeEventListener('abort', onAbort)
+        req.signal?.removeEventListener('abort', onRequestAbort)
+        res.removeListener('close', onClientClose)
+      }
+    }
+
+    if (accountList.length === 0) {
+      const result = await callOnce('')
+      if (req.signal?.aborted || res.destroyed || res.writableEnded) {
+        cancelUnwrittenResponsesStream(result, req.signal?.reason ?? new Error('client disconnected'))
+        trace.lastState = 'transport'
+        trace.lastError = 'client disconnected during native Responses supplier setup'
+        return false
+      }
+      if (!result.ok) {
+        trace.lastState = result.state
+        trace.lastError = `${result.state}: ${result.message}`
+        pool.noteFailure('', providerModel, result.state, result.message, result.resetAt)
+        return false
+      }
+      trace.uid = '(no-account)'
+      recordModel()
+      probe.uid = ''
+      const writeRemaining = firstByteDeadlineAt - Date.now()
+      if (writeRemaining <= 0 && 'stream' in result) {
+        void result.stream.cancel(new Error('first-byte budget exhausted')).catch(() => {})
+        pool.noteFailure('', providerModel, 'transport', 'first-byte budget exhausted')
+        trace.lastState = 'transport'
+        trace.lastError = 'first-byte budget exhausted'
+        return false
+      }
+      const committed = await writeResponsesResult(
+        res, result, req.stream, probe, probe.startedAt, writeRemaining, req.signal,
+      ).catch(() => false)
+      if (!committed) {
+        trace.lastState = 'transport'
+        trace.lastError = 'native Responses response writer failed before commit'
+        if (!clientGone() && !res.headersSent) {
+          pool.noteFailure('', providerModel, 'transport', trace.lastError)
+        }
+      }
+      return committed
+    }
+
+    const input = reqResponsesInput(req.rawBody)
+    const tried = new Set<string>()
+    for (;;) {
+      const uid = pool.pick(accountList.filter((account) => !tried.has(account.uid)), cfg.poolOrder, providerModel, input, req.session)
+      if (uid === undefined) return false
+      const remaining = firstByteDeadlineAt - Date.now()
+      if (remaining <= 0) {
+        trace.lastState = 'transport'
+        trace.lastError = 'first-byte budget exhausted'
+        return false
+      }
+      const pickWhy = pool.lastWhy
+      tried.add(uid)
+      const result = await callOnce(uid)
+      if (req.signal?.aborted || res.destroyed || res.writableEnded) {
+        cancelUnwrittenResponsesStream(result, req.signal?.reason ?? new Error('client disconnected'))
+        trace.lastState = 'transport'
+        trace.lastError = 'client disconnected during native Responses supplier setup'
+        return false
+      }
+      if (!result.ok) {
+        if (result.state === 'no_such_model' || result.state === 'bad_request') {
+          trace.lastState = result.state
+          trace.lastError = `${result.state}: ${result.message}`
+          return false
+        }
+        pool.noteFailure(uid, providerModel, result.state, result.message, result.resetAt)
+        pool.dropBlock(providerModel)
+        trace.attempts += 1
+        trace.lastState = result.state
+        trace.lastError = `${result.state}: ${result.message}`
+        continue
+      }
+      const writeRemaining = firstByteDeadlineAt - Date.now()
+      if (writeRemaining <= 0 && 'stream' in result) {
+        void result.stream.cancel(new Error('first-byte budget exhausted')).catch(() => {})
+        pool.noteFailure(uid, providerModel, 'transport', 'first-byte budget exhausted')
+        trace.attempts += 1
+        trace.lastState = 'transport'
+        trace.lastError = 'first-byte budget exhausted'
+        return false
+      }
+      pool.noteSuccess(uid, providerModel)
+      trace.uid = uid
+      trace.pickWhy = pickWhy
+      recordModel()
+      probe.uid = uid
+      const committed = await writeResponsesResult(
+        res, result, req.stream, probe, probe.startedAt, writeRemaining, req.signal,
+      ).catch(() => false)
+      if (committed) {
+        pool.noteCache(uid, providerModel, probe.tokens?.cachedTokens ?? 0, req.session)
+        return true
+      }
+      if (req.signal?.aborted || res.headersSent || res.writableEnded || res.destroyed) return false
+      pool.noteFailure(uid, providerModel, 'transport', 'native Responses stream failed before first byte')
+      trace.attempts += 1
+      trace.lastState = 'transport'
+      trace.lastError = 'native Responses stream failed before first byte'
+    }
+  }
+
   /**
    * 处理 /v1/chat/completions。
    * - model 命中组合名 → 在组合模型里按策略选一个，交给供应商；失败按回退顺序尝试剩余模型。
@@ -1384,9 +1988,69 @@ export class Router {
     // 看见 OpenAI 形态），翻译只此一处，四个入口（组合腿/直调/测试/探测）
     // 全部受益。wire = 'chat'（缺省，今天所有供应商）时零成本返回原函数。
     const chatOnce = this.wireOf(s)
+    const clientGone = (): boolean => req.signal?.aborted === true || res.destroyed
+    const callChatOnce = async (uid: string): Promise<{ result?: ChatOnceResult; cancelled: boolean }> => {
+      if (req.signal === undefined) return { result: await chatOnce(uid, req.lv ?? 'auto', req), cancelled: false }
+      const controller = new AbortController()
+      let abortKind: 'client' | 'timeout' | undefined
+      let timer: ReturnType<typeof setTimeout> | undefined
+      let resolveAbort!: (value: { result?: ChatOnceResult; cancelled: boolean }) => void
+      const aborted = new Promise<{ result?: ChatOnceResult; cancelled: boolean }>((resolve) => { resolveAbort = resolve })
+      const finishAbort = (kind: 'client' | 'timeout', reason: unknown): void => {
+        if (controller.signal.aborted) return
+        abortKind = kind
+        controller.abort(reason)
+        resolveAbort(kind === 'client'
+          ? { cancelled: true }
+          : { result: { ok: false, state: 'transport', message: 'first-byte budget exhausted' }, cancelled: false })
+      }
+      const onRequestAbort = (): void => finishAbort('client', req.signal?.reason ?? new Error('client disconnected'))
+      const onResponseClose = (): void => finishAbort('client', new Error('client disconnected'))
+      const remaining = firstByteDeadlineAt - Date.now()
+      if (req.signal.aborted || res.destroyed || res.writableEnded) onRequestAbort()
+      else {
+        req.signal.addEventListener('abort', onRequestAbort, { once: true })
+        res.once('close', onResponseClose)
+        if (remaining <= 0) finishAbort('timeout', new Error('first-byte budget exhausted'))
+        else timer = setTimeout(() => finishAbort('timeout', new Error('first-byte budget exhausted')), remaining)
+      }
+      const pending = Promise.resolve().then(() => {
+        if (controller.signal.aborted) {
+          return { ok: false as const, state: 'transport' as const, message: 'request aborted before Chat dispatch' }
+        }
+        return chatOnce(uid, req.lv ?? 'auto', { ...req, signal: controller.signal })
+      }).catch((error: unknown): ChatOnceResult => ({
+        ok: false,
+        state: 'transport',
+        message: error instanceof Error ? error.message : String(error),
+      }))
+      void pending.then((lateResult) => {
+        if (controller.signal.aborted && lateResult.ok && 'stream' in lateResult) {
+          void lateResult.stream.cancel(controller.signal.reason).catch(() => {})
+        }
+      })
+      try {
+        const raced = await Promise.race([
+          pending.then((result) => ({ result, cancelled: false })),
+          aborted,
+        ])
+        if (abortKind === 'client' && raced.result?.ok === true && 'stream' in raced.result) {
+          void raced.result.stream.cancel(controller.signal.reason).catch(() => {})
+        }
+        return raced
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+        req.signal.removeEventListener('abort', onRequestAbort)
+        res.removeListener('close', onResponseClose)
+      }
+    }
     if (s.accounts !== undefined && s.accounts().length === 0) {
-      const r = await chatOnce('', req.lv ?? 'auto', req)
+      const called = await callChatOnce('')
+      if (called.cancelled || clientGone()) return false
+      const r = called.result
+      if (r === undefined) return false
       if (!r.ok) {
+        if (clientGone()) return false
         // 模型不属于本供应商、或请求本身被上游拒收：换供应商，不记账
         if (r.state === 'no_such_model' || r.state === 'bad_request') return false
         if (trace !== undefined) trace.lastState = r.state
@@ -1405,7 +2069,7 @@ export class Router {
         probe.uid = ''
       }
       return await writeChatResult(
-        res, r, req.stream, probe, probe?.startedAt ?? 0, firstByteDeadlineAt - Date.now(),
+        res, r, req.stream, probe, probe?.startedAt ?? 0, firstByteDeadlineAt - Date.now(), req.signal,
       )
     }
     // 试过的号不再选：某些失败状态既不冷却也不计数（如模型不属于本供应商），
@@ -1451,8 +2115,12 @@ export class Router {
       }
       pickWhy = pool.lastWhy
       tried.add(uid)
-      const r = await chatOnce(uid, req.lv ?? 'auto', req)
+      const called = await callChatOnce(uid)
+      if (called.cancelled || clientGone()) return false
+      const r = called.result
+      if (r === undefined) return false
       if (!r.ok) {
+        if (clientGone()) return false
         // 模型不属于本供应商、或请求本身被上游拒收：整个供应商都跳过，
         // 换号重试没有意义，也不能记在账号头上（否则无关账号会被冷掉）。
         // bad_request（如 tool_call 配对断裂、图片格式不认）对每个号结果相同，
@@ -1464,7 +2132,9 @@ export class Router {
           }
           return false
         }
-        pool.noteFailure(uid, req.model, r.state, r.message, r.resetAt)
+        if (req.signal === undefined || r.message !== 'first-byte budget exhausted') {
+          pool.noteFailure(uid, req.model, r.state, r.message, r.resetAt)
+        }
         // 故障切走：下次选号会换号，旧块的驻留计数不再适用（前缀归属变了）
         pool.dropBlock(req.model)
         if (trace !== undefined) {
@@ -1474,7 +2144,7 @@ export class Router {
         }
         continue
       }
-      pool.noteSuccess(uid, req.model)
+      if (req.signal === undefined) pool.noteSuccess(uid, req.model)
       if (trace !== undefined) {
         trace.uid = uid
         trace.pickWhy = pickWhy
@@ -1487,14 +2157,18 @@ export class Router {
         probe.model = `${s.getAlias()}/${stripAlias(req.model, s.getAlias())}`
         probe.uid = uid
       }
-      const committed = await writeChatResult(res, r, req.stream, probe, probe?.startedAt ?? 0, firstByteDeadlineAt - Date.now())
-      if (committed) {
-        // 块轮询反馈：只有成功请求才计入（失败没产生缓存，计入会污染命中率）
+      const committed = await writeChatResult(
+        res, r, req.stream, probe, probe?.startedAt ?? 0, firstByteDeadlineAt - Date.now(), req.signal,
+      )
+      if (committed && !clientGone()) {
+        // Compatibility ingress updates pool health only after the Responses translation commits.
+        if (req.signal !== undefined) pool.noteSuccess(uid, req.model)
         pool.noteCache(uid, req.model, probe?.tokens?.cachedTokens ?? 0, req.session)
         return true
       }
+      if (clientGone()) return false
       // 一个字节都没写（上游刚连上就断 / 首字节超时）→ 这个号不算数，换下一个重试
-      pool.noteFailure(uid, req.model, 'transport', 'stream failed before first byte')
+      if (req.signal === undefined) pool.noteFailure(uid, req.model, 'transport', 'stream failed before first byte')
       if (trace !== undefined) {
         trace.attempts += 1
         trace.lastState = 'transport'

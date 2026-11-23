@@ -253,6 +253,75 @@ test('anthropic 响应帧往返：text / thinking / tool_use / finish', () => {
   assert.equal(finishOf(back), 'tool-calls', 'tool_use → tool-calls')
 })
 
+test('responses SSE tool indices map to Chat order and preserve call_id', () => {
+  const codec = codecOf('responses')
+  const session = codec.createSession?.()
+  const decode = (event: string, payload: JsonObject): ChatEvent[] => codec.decodeFrame(JSON.stringify(payload), event, session)
+  const events = [
+    ...decode('response.output_item.added', { output_index: 5, item: { id: 'item_a', call_id: 'call_a', type: 'function_call', name: 'first' } }),
+    ...decode('response.function_call_arguments.delta', { output_index: 5, delta: '{"a":' }),
+    ...decode('response.output_item.added', { output_index: 9, item: { id: 'item_b', call_id: 'call_b', type: 'function_call', name: 'second' } }),
+    ...decode('response.function_call_arguments.delta', { output_index: 9, delta: '2}' }),
+  ]
+  assert.deepEqual(events.filter((event) => event.type === 'tool-start'), [
+    { type: 'tool-start', index: 0, id: 'call_a', name: 'first' },
+    { type: 'tool-start', index: 1, id: 'call_b', name: 'second' },
+  ])
+  assert.deepEqual(events.filter((event) => event.type === 'tool-args'), [
+    { type: 'tool-args', index: 0, delta: '{"a":' },
+    { type: 'tool-args', index: 1, delta: '2}' },
+  ])
+})
+
+test('responses incomplete terminal status round-trips content-filter distinctly', () => {
+  const codec = codecOf('responses')
+  const session = codec.createSession?.()
+  const frames = codec.endFrames({ model: 'm', stream: true, finish: 'content-filter' }, session)
+  const payloads = frames.map((frame) => JSON.parse(frame.match(/^event: [^\n]+\ndata: ([\s\S]*)\n\n$/)?.[1] ?? '{}') as JsonObject)
+  const terminal = payloads.find((payload) => payload.type === 'response.completed')
+  assert.equal((terminal?.response as JsonObject)?.status, 'incomplete')
+  assert.deepEqual((terminal?.response as JsonObject)?.incomplete_details, { reason: 'content_filter' })
+  assert.equal(finishOf(codec.decodeFrame(JSON.stringify(terminal), 'response.completed', codec.createSession?.())), 'content-filter')
+})
+
+test('responses non-stream JSON finalizes item status to match the terminal response', () => {
+  const codec = codecOf('responses')
+  const cases: Array<{ finish: ChatEvent; status: string; itemStatus: string }> = [
+    { finish: { type: 'finish', reason: 'stop' }, status: 'completed', itemStatus: 'completed' },
+    { finish: { type: 'finish', reason: 'length' }, status: 'incomplete', itemStatus: 'incomplete' },
+    { finish: { type: 'finish', reason: 'content-filter' }, status: 'incomplete', itemStatus: 'incomplete' },
+    { finish: { type: 'error', message: 'upstream failure' }, status: 'failed', itemStatus: 'incomplete' },
+  ]
+  for (const { finish, status, itemStatus } of cases) {
+    const response = codec.encodeJson([
+      { type: 'text', text: 'partial' },
+      { type: 'reasoning', text: 'thinking' },
+      { type: 'tool-start', index: 0, id: 'call_1', name: 'lookup' },
+      { type: 'tool-args', index: 0, delta: '{"q":1}' },
+      finish,
+    ], { model: 'm', stream: false })
+    assert.equal(response.status, status)
+    assert.deepEqual(response.output.map((item) => item.status), [itemStatus, itemStatus, itemStatus])
+  }
+})
+
+test('responses failed terminal does not claim output items completed', () => {
+  const codec = codecOf('responses')
+  const session = codec.createSession?.()
+  const frames = [
+    ...codec.encodeFrame({ type: 'text', text: 'partial' }, session),
+    ...codec.encodeFrame({ type: 'error', message: 'upstream failure' }, session),
+    ...codec.endFrames({ model: 'm', stream: true, finish: 'error' }, session),
+  ]
+  const outputItems = frames
+    .filter((frame) => frame.startsWith('event: response.output_item.done'))
+    .map((frame) => JSON.parse(frame.match(/^event: [^\n]+\ndata: ([\s\S]*)\n\n$/)?.[1] ?? '{}') as JsonObject)
+  assert.equal(outputItems[0]?.item && (outputItems[0].item as JsonObject).status, 'incomplete')
+  const terminal = frames.map((frame) => JSON.parse(frame.match(/^event: [^\n]+\ndata: ([\s\S]*)\n\n$/)?.[1] ?? '{}') as JsonObject)
+    .find((payload) => payload.type === 'response.failed')
+  assert.equal((terminal?.response as JsonObject)?.status, 'failed')
+})
+
 test('responses 响应帧往返：text / tool / finish', () => {
   const events: ChatEvent[] = [
     { type: 'text', text: 'hi' },
@@ -264,7 +333,7 @@ test('responses 响应帧往返：text / tool / finish', () => {
   const back = roundTripEvents('responses', events)
   assert.equal(textOf(back), 'hi')
   assert.deepEqual(toolsOf(back), [{ name: 'ls', args: '{"p":"/"}' }])
-  assert.equal(finishOf(back), 'stop')
+  assert.equal(finishOf(back), 'tool-calls')
 })
 
 test('gemini 响应帧往返：text / functionCall / usage / finish', () => {
@@ -497,7 +566,9 @@ test('★ 回归：Responses 收尾帧必须带 status 与 usage（Codex 靠它�
   assert.ok(cut.includes('"status":"incomplete"'), '截断必须是 incomplete')
 
   // 工具轮 → output 里要有 function_call，否则往返后认不出 tool-calls
-  const tool = codec.endFrames({ model: 'm', stream: true, finish: 'tool-calls' }).join('')
+  const toolSession = codec.createSession?.()
+  codec.encodeFrame({ type: 'tool-start', index: 0, id: 'call_tool', name: 'tool' }, toolSession)
+  const tool = codec.endFrames({ model: 'm', stream: true, finish: 'tool-calls' }, toolSession).join('')
   assert.ok(tool.includes('function_call'), '工具轮的 output 缺 function_call')
 })
 

@@ -216,6 +216,44 @@ test('用户目录只加载 *.js，且同 id 后者覆盖前者（按文件名�
   assert.equal(suppliers[0]?.source, 'user')
 })
 
+test('显式 supplier bundle 隔离 env、传播 wire，且单个 factory 失败不阻断兄弟项', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sup-bundle-'))
+  writeFileSync(join(dir, 'bundle.js'), `
+const make = (id, env, wire) => ({
+  id, name: id, wire,
+  status: () => ({ id, name: id, accounts: [] }),
+  listModels: () => [],
+  chatOnce: async () => ({ ok: true, status: 200, body: '{}' }),
+  dispose: () => {},
+  getEnv: () => env,
+})
+export default {
+  kind: 'dsh-supplier-bundle',
+  providers: [
+    { id: 'broken', create: () => { throw new Error('factory failed') } },
+    { id: 'bundle-a', create: (env) => make('bundle-a', env, 'responses') },
+    { id: 'bundle-b', create: (env) => make('bundle-b', env) },
+  ],
+}
+`)
+  const { env: e } = env()
+  const result = await loadSuppliers({
+    userDir: dir,
+    dataDir: dir,
+    store: e.store,
+    credentials: e.credentials,
+    log: () => {},
+  })
+  assert.deepEqual(result.suppliers.map((entry) => entry.supplier.id), ['bundle-a', 'bundle-b'])
+  assert.equal(result.errors.length, 1)
+  assert.equal(result.errors[0]?.id, 'broken')
+  assert.equal(result.errors[0]?.error, 'factory failed')
+  assert.equal(result.suppliers[0]?.supplier.wire, 'responses')
+  const moduleA = (result.suppliers[0]?.supplier as unknown as { __module?: { getEnv?: () => unknown } }).__module
+  const moduleB = (result.suppliers[1]?.supplier as unknown as { __module?: { getEnv?: () => unknown } }).__module
+  assert.notEqual(moduleA?.getEnv?.(), moduleB?.getEnv?.())
+})
+
 // ---------------------------------------------------------------------------
 // 插件报的「额度用完」要真的进路由（end-to-end 的那一段线）
 // ---------------------------------------------------------------------------

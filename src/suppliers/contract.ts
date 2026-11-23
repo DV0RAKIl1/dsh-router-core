@@ -10,7 +10,7 @@
  * 内置供应商与用户 js 同构（差异化能力驱动）。
  */
 import type { Context } from '@deepseek-ai/cordis'
-import type { ChatRequest, ModelInfo, SupplierAccount } from '../router/types.ts'
+import type { ChatRequest, ModelInfo, ResponsesRequest, SupplierAccount } from '../router/types.ts'
 import type { SupplierConfigStore } from '../supplier-config.ts'
 import type { CredentialStore } from '../credential-store.ts'
 import type { ProtocolId } from '../protocol/types.ts'
@@ -58,6 +58,17 @@ export interface SupplierEnv {
 export type SupplierFactory = ((env: SupplierEnv) => SupplierModule) & {
   source?: 'builtin'
   wire?: ProtocolId
+}
+
+/** A single scanned JavaScript file may explicitly export several isolated providers. */
+export interface SupplierBundleProvider {
+  readonly id: string
+  readonly create: SupplierFactory
+}
+
+export interface SupplierBundle {
+  readonly kind: 'dsh-supplier-bundle'
+  readonly providers: readonly SupplierBundleProvider[]
 }
 
 /**
@@ -139,6 +150,12 @@ export type ChatOnceResult =
    */
   | { ok: false; state: AccountState; message: string; resetAt?: number }
 
+/** Native Responses result; successful bodies and streams stay in Responses format. */
+export type ResponsesOnceResult =
+  | { ok: true; stream: ReadableStream<Uint8Array> }
+  | { ok: true; status: number; body: string }
+  | { ok: false; state: AccountState; message: string; resetAt?: number }
+
 /** 供应商模块 —— 契约（核心必须，差异化可选）。 */
 export interface SupplierModule {
   /** 供应商唯一 id（小写字母数字 - _）。 */
@@ -147,6 +164,8 @@ export interface SupplierModule {
   readonly name: string
   /** 优先级：数字越小越优先（免费通道优先）。 */
   readonly priority?: number
+  /** 上游协议；缺省为 Chat Completions。 */
+  readonly wire?: ProtocolId
   /** 图标（URL 或 SVG data URI），面板供应商卡片显示。可选。 */
   readonly icon?: string
 
@@ -175,6 +194,8 @@ export interface SupplierModule {
    * 插件不必自己存一份「上次失败」的状态。
    */
   chatOnce(uid: string, lv: string, req: ChatRequest): Promise<ChatOnceResult>
+  /** Optional native Responses path; it receives the original Responses-shaped body. */
+  responsesOnce?(uid: string, lv: string, req: ResponsesRequest): Promise<ResponsesOnceResult>
   dispose(): void
 
   // ---- 差异化能力（可选，按存在性暴露端点/UI） ----
