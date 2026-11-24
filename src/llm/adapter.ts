@@ -56,6 +56,16 @@ export interface RouterAttachmentStore {
 const MAX_REQUEST_PIXELS = 64e4
 /** 送上游的请求图的字节上限。 */
 const MAX_REQUEST_BYTES = 1024 * 1024
+/** pi-ai's Responses serializer limits prompt cache keys to 64 Unicode code points. */
+const PROMPT_CACHE_KEY_MAX_LENGTH = 64
+
+function clampPromptCacheKey(key: string | undefined): string | undefined {
+  if (key === undefined) return undefined
+  const codePoints = Array.from(key)
+  return codePoints.length <= PROMPT_CACHE_KEY_MAX_LENGTH
+    ? key
+    : codePoints.slice(0, PROMPT_CACHE_KEY_MAX_LENGTH).join('')
+}
 
 /**
  * 把源图尺寸投影到「总像素 ≤ maxPixels」的请求目标（等比、只缩不放）。
@@ -312,6 +322,8 @@ function imagePlaceholder(attachmentId: string): string {
 export async function wireResponsesRequest(options: GenerateOptions, attachments: RouterAttachmentStore | undefined, log?: (msg: string) => void): Promise<JsonObject> {
   const chatBody = await wireRequest(options, attachments, log)
   const body = responsesCodec.fromChat(chatBody as JsonObject, { model: options.model, stream: true })
+  const promptCacheKey = clampPromptCacheKey(options.sessionId)
+  if (promptCacheKey !== undefined) body.prompt_cache_key = promptCacheKey
 
   // These fields belong to Chat Completions. Responses has its own reasoning shape;
   // silently forwarding the Chat names makes some providers reject the request.

@@ -29,6 +29,13 @@ test('nativeResponsesBody rewrites only the selected model and stream flag', () 
   })
 })
 
+test('nativeResponsesBody preserves a caller-supplied prompt cache key', () => {
+  const body = JSON.parse(nativeResponsesBody(request({
+    rawBody: JSON.stringify({ model: 'alias/model-x', input: 'hello', prompt_cache_key: 'caller-key', stream: false }),
+  }), 'model-x')) as Record<string, unknown>
+  assert.equal(body.prompt_cache_key, 'caller-key')
+})
+
 test('requestNativeResponses preserves JSON body/status and forwards provider headers', async () => {
   let capturedUrl = ''
   let capturedInit: RequestInit | undefined

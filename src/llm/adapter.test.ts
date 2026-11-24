@@ -639,6 +639,19 @@ test('Responses wire：内部请求保留图像/工具/推理，并移除 Chat �
   assert.deepEqual(body.tools, [{ type: 'function', name: 'bash', description: 'run', parameters: { type: 'object' } }])
 })
 
+test('Responses wire：prompt_cache_key matches the native session key policy', async () => {
+  const withoutSession = await captureResponsesBody({ messages: [] })
+  assert.equal('prompt_cache_key' in withoutSession, false)
+
+  const sessionId = 'session-固定-session'
+  const withSession = await captureResponsesBody({ messages: [], sessionId })
+  assert.equal(withSession.prompt_cache_key, sessionId)
+
+  const longSessionId = '😀'.repeat(64) + 'tail'
+  const withLongSession = await captureResponsesBody({ messages: [], sessionId: longSessionId })
+  assert.equal(withLongSession.prompt_cache_key, '😀'.repeat(64))
+})
+
 test('wire：空工具结果发空串，不伪造 (no output) 字面量', async () => {
   // 模型会以为工具真打印了那句话 —— 对「bash 无输出」是误导。
   const body = await captureBody({
