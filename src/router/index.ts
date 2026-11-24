@@ -330,16 +330,16 @@ function sinkRes(sink: ResponseSink, underlying?: ServerResponse): ServerRespons
       return self
     },
     flushHeaders: (): void => {},
-    once: (event: string, listener: (...args: never[]) => void): unknown => {
-      if (underlying !== undefined) underlying.once(event, listener as (...args: never[]) => void)
+    once: (event: string, listener: (...args: unknown[]) => void): unknown => {
+      if (underlying !== undefined) underlying.once(event, listener)
       return self
     },
-    on: (event: string, listener: (...args: never[]) => void): unknown => {
-      if (underlying !== undefined) underlying.on(event, listener as (...args: never[]) => void)
+    on: (event: string, listener: (...args: unknown[]) => void): unknown => {
+      if (underlying !== undefined) underlying.on(event, listener)
       return self
     },
-    removeListener: (event: string, listener: (...args: never[]) => void): unknown => {
-      if (underlying !== undefined) underlying.removeListener(event, listener as (...args: never[]) => void)
+    removeListener: (event: string, listener: (...args: unknown[]) => void): unknown => {
+      if (underlying !== undefined) underlying.removeListener(event, listener)
       return self
     },
     destroy: (): void => {
@@ -1569,6 +1569,7 @@ export class Router {
     trace: ChatTrace = { attempts: 0 },
     firstByteDeadlineAt = Date.now() + this.firstByteBudgetMs,
   ): Promise<boolean> {
+    const clientGone = (): boolean => req.signal?.aborted === true || res.destroyed || res.writableEnded
     const comma = model.indexOf(',')
     if (comma <= 0) {
       trace.lastState = 'no_such_model'
