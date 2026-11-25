@@ -394,20 +394,50 @@ export default {
 
 每项必须有唯一、非空 `id` 和 `create(env)` 工厂,工厂返回的模块 `id` 必须与条目一致。bundle 为空、结构非法或 id 重复会使该文件加载失败；单项工厂抛错或返回无效模块时只记录该项错误,其余项仍会加载。每项都会获得独立的 `env` 浅拷贝及独立账号池,`store`、`credentials` 等服务仍由核心共享。供应商模块仍遵守上面的常规接口；`wire` 与 `responsesOnce` 等可选能力也按单项生效。
 
-配置驱动的供应商可把 `providers.js` 与相邻 JSON 配置放在用户目录,由 JS 工厂按 provider id 生成常规模块。ESM 适配器可用 Node 内置 `createRequire(import.meta.url)` 读取同目录 JSON,不需新增依赖。迁移时先逐项比对模型策略、探测状态、超时、请求头、错误映射和自定义端点，再把旧脚本移出扫描目录；扫描器只加载顶层 `*.js`,且同 id 仍按文件名字典序后者覆盖前者。原始脚本应在迁移归档中保留,以便回滚和行为对照。
+自定义供应商应只包含可公开维护的适配逻辑；账号凭证与环境配置留在各自的 DSH profile 中，不要提交 profile 配置文件或密钥。需要迁移既有适配器时，先用离线 mock 测试覆盖模型发现、请求 URL/头、错误映射和取消行为，再替换原文件；保留私有备份以便回滚。
 
-原生 Responses 是按模块能力(`responsesOnce`)选择,不依据模型名称猜测。供应商可针对 Responses 使用独立上游 URL,并在该方法中保持请求体、流式取消及失败状态映射。DSH 内部 `RouterAdapter` 现在直接请求本插件 `/v1/responses`,核心路由再原样调用供应商的 `responsesOnce`;这条主链路不经过 Chat→Responses 转换。外部仍主动请求 `/v1/chat/completions` 时,才使用供应商的 Chat 兼容实现；核心自带的 OpenRouter、NVIDIA、OpenCode 供应商仍由各自内置模块提供,不应并入用户 bundle。
+### DeepSeek Responses 示例
 
-### 配置驱动适配器示例
+仓库中的 [`examples/suppliers/deepseek-responses.js`](../examples/suppliers/deepseek-responses.js) 是独立 ESM 供应商示例。它通过 DeepSeek `/v1/models` 动态发现账号可用模型，Chat Completions 使用 `/v1/chat/completions`，原生 Responses 使用明确的 `https://api.deepseek.com/responses` endpoint。协议细节见 [DeepSeek Responses API 文档](https://api-docs.deepseek.com/guides/responses_api/)；可用模型以账号实际返回的模型列表为准。
 
-本机 Web profile 的 15 个自定义供应商由 `~/.dsh/profiles/web/suppliers/providers.js` 加载,规格位于相邻的 `providers.json`。每条配置保留供应商 id、名称、优先级、base URL、key hint、探测模型和 fallback 列表,并按需声明：
+1. 将示例复制到 `<profile>/suppliers/deepseek-responses.js`，然后重启 `dsh web`。
+2. 在 DSH Router 面板的供应商设置中添加 DeepSeek API key。该密钥用于访问 DeepSeek 上游 API，并由 DSH 凭证服务保存；它与下方可选的 DSH Router 本地 API 鉴权密钥是两把不同的密钥。
+3. 从「端点与密钥」面板复制 Router base URL。若已启用本地 Router 鉴权，在请求中使用对应的 DSH Router key；未启用时可省略该授权头。不要把任何真实密钥写进示例或文档。
 
-- 模型响应形状(`modelPayload`)、HTTP/异常/空列表时供应商自身的兼容 fallback 策略(`modelsHttpFailure`、`modelsExceptionFailure`、`emptyModels`)；这层仅用于保留旧适配器面对上游故障时的返回行为,不取代核心的 TTL 与 stale-while-revalidate 缓存。
-- 探测成功状态与错误映射(`probe*`)、探测/正式请求头(`probeHeaders`、`headers`)
-- 模型过滤/去重/上下文归一化(`modelFilter`、`dedupeModels`、`modelNormalize`)与正式请求超时类型(`chatTimeout`)
-- 原生 Responses URL(`responsesUrl`)与可选的外部 Chat→Responses 兼容桥(`chatBridge`);当前 Web profile 仅 AllTokens 保留 `chatBridge: "responses"`,其余供应商的外部 Chat 请求仍走各自 `/chat/completions`
+示例请求（将 URL、模型名和密钥替换为本机配置；`<model-id>` 来自供应商模型列表）：
 
-当前有意保留的供应商差异包括：SSDY 接受原始数组或 `.data` 模型列表；RRX、YJ、AMD、DeepSeek、JBB 将 HTTP 失败使用 fallback、异常交给缓存/fallback、有效空数组照常返回；Codex666 过滤非 Chat 模型、去重并把 context token 数除以 1000 后封顶 250；OpenCode 使用不同的正式请求与探测请求头且失败时只返回缓存/空列表；RRX/YJ 使用总请求超时，其他供应商的 Chat 请求只对响应头设 120 秒预算；DeepSeek Responses 使用不同于其 `/v1` base 的显式 `/responses` endpoint；DSH 内部请求统一走本地 `/v1/responses` 后直连各供应商 Responses，只有 AllTokens 的外部 Chat 兼容入口把 Chat 映射为 Responses 并将 SSE 转回 Chat。配置变化应通过离线 mock 测试覆盖请求 URL、头、模型与错误策略,禁止将真实凭证写入测试或文档。
+```bash
+curl "${DSH_ROUTER_BASE_URL}/v1/responses" \\
+  -H "Authorization: Bearer ${DSH_ROUTER_KEY}" \\
+  -H 'Content-Type: application/json' \\
+  -d '{
+    "model": "deepseek-responses/<model-id>",
+    "input": [{"role": "user", "content": [{"type": "input_text", "text": "Reply with OK"}]}],
+    "stream": false
+  }'
+```
+
+如果 DSH Router 本地 API 鉴权未启用，移除 `Authorization` 头。示例会保留调用方 Responses body 中的其他字段并改写所选模型与 `stream`；这不代表 DeepSeek 上游一定支持或使用某个缓存字段。若要验证上游缓存，只能在重复的相同上下文请求中检查 DeepSeek 实际返回的 `usage.input_tokens_details.cached_tokens`（若响应包含该字段）；传递 `prompt_cache_key` 本身不是命中证据。
+
+#### 外部客户端经 DSH Router 调用时的会话身份
+
+这里的“外部客户端”指 `curl`、Python/OpenAI SDK、Codex 或其他程序把 base URL 配成 DSH Router 的客户端。请求仍会经过 DSH 的账号池、会话亲和、冷却和失败换号，但这类客户端通常没有 DSH 内部注入的 `x-dsh-router-session`。没有该请求头时，Router 会依次使用请求体的 `user`、`prompt_cache_key`，最后才使用 `User-Agent` 作为调用方身份。
+
+多会话或多 agent 调用时，请为每个会话提供稳定且彼此不同的身份键，并在同一会话的后续请求中保持不变。例如可以使用 `user: "team/agent-a/conversation-42"`；如果客户端能设置自定义请求头，也可以使用稳定的 `x-dsh-router-session`。不要只依赖所有成员都相同的 `User-Agent`，否则 Router 无法可靠区分它们，账号亲和和前缀缓存隔离也会变得不稳定：
+
+```bash
+curl "${DSH_ROUTER_BASE_URL}/v1/responses" \\
+  -H "Authorization: Bearer ${DSH_ROUTER_KEY}" \\
+  -H 'Content-Type: application/json' \\
+  -H 'x-dsh-router-session: team/agent-a/conversation-42' \\
+  -d '{
+    "model": "deepseek-responses/<model-id>",
+    "user": "team/agent-a/conversation-42",
+    "input": [{"role": "user", "content": [{"type": "input_text", "text": "Reply with OK"}]}]
+  }'
+```
+
+这与直接请求 `https://api.deepseek.com/responses` 不同：后者绕过 DSH Router，不会使用 DSH 的路由、账号池、会话亲和、冷却或失败换号。DSH 内部 team 会自动传递成员的会话身份；本节主要适用于 Router 外部的调用方。
 
 **模型统一策略**:模型列表**优先从上游拉取**,常规 TTL 缓存由核心统一管
 (`Router.modelsOf`,TTL 10 分钟),js 不应再添加独立 TTL 缓存,否则过期策略会叠加。
@@ -416,17 +446,16 @@ export default {
 
 核心缓存是 **stale-while-revalidate**:过期后**先返回旧值**让面板立刻有内容,
 后台再重新拉。所以 `listModels` 被调用的时机是:
-
 - **冷启动**(该供应商第一次被问,没有旧值)——**会同步等**,全程只有这一次
 - **TTL 过期后的第一次**——返回旧值,`listModels` 在**后台**被调用
 - **手动点「获取模型」**(`force=true`)——**会同步等**,用户要看到结果
 
+DeepSeek 示例每次 `listModels` 调用都会请求 `/v1/models`，而不是只在 `force=true` 时回源；核心仍负责对调用方缓存模型结果。这里不做逐模型探测等重活。
+
 因此:
 
-- `listModels` 要**快**:别在里面做全量探测之类的重活。重活放到 `force=true`
-  时做(如按模型探测可用性)
-- 冷启动那次会拖慢面板首屏(实测 0.3~1.0s/供应商,组合页取最慢那家),
-  **别在这条路上加重活**——这是唯一一次用户真会等到的调用
+- `listModels` 要**快**：目录请求不做全量探测等重活。若某供应商需要昂贵的可用性探测，可在需要时按模型执行；DeepSeek 示例仅查询 `/v1/models`。
+- 冷启动时核心会等待一次 `listModels`；DeepSeek 示例该调用只进行模型目录请求。
 - 拉到空列表时核心会保住旧值不当成新结果,所以别用「返回空」表达
   「上游出错」;出错就抛,核心会退回旧值(首次则整个供应商剔除)
 

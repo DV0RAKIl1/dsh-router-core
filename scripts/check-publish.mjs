@@ -313,13 +313,16 @@ if (process.argv.includes('--pack')) {
   const out = execFileSync('npm', ['pack', '--dry-run', '--json', '--cache', join(root, '.npm-cache')], {
     cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
   })
-  const files = (JSON.parse(out)[0]?.files ?? []).map((f) => f.path)
-  const want = ['lib/index.js', 'lib/client.js', 'lib/client-registry.js', 'cordis.patch.yml']
-  for (const rel of want) if (!files.includes(rel)) problems.push(`npm pack 产物里缺 ${rel}`)
+  const packReport = JSON.parse(out)
+  const reports = Array.isArray(packReport) ? packReport : Object.values(packReport)
+  const files = reports.find((report) => Array.isArray(report?.files))?.files ?? []
+  const packedPaths = files.map((f) => f.path)
+  const want = ['lib/index.js', 'lib/client.js', 'lib/client-registry.js', 'cordis.patch.yml', 'examples/suppliers/echo.js', 'examples/suppliers/deepseek-responses.js']
+  for (const rel of want) if (!packedPaths.includes(rel)) problems.push(`npm pack 产物里缺 ${rel}`)
   for (const sub of rowSubpaths) {
     for (const rel of ['index.js', 'package.json', 'locale/en.json', 'locale/zh.json']) {
       const want = `lib/${sub}/${rel}`
-      if (!files.includes(want)) problems.push(`npm pack 产物里缺 ${want}（行少了它就是静默降级）`)
+      if (!packedPaths.includes(want)) problems.push(`npm pack 产物里缺 ${want}（行少了它就是静默降级）`)
     }
   }
   console.log(`✓ npm pack 含 ${rowSubpaths.length} 个行`)

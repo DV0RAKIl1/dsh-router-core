@@ -45,25 +45,24 @@ dsh-router 按**会话身份**亲和选号:同会话固定落同一个连接(前
 
 ## 快速安装
 
-需要 **DSH `0.2.0` 及以上**、Node.js `>= 20`,以及 `web` profile。0.1.x 宿主不再支持(设置注册、
+需要 **DSH `0.2.0` 及以上**、Node.js `>= 22.13.0`（`node:sqlite` 无需实验性启动参数），以及 `web` profile。0.1.x 宿主不再支持(设置注册、
 tool 消息形态都已按 0.2.0 单面实现)。
 
 ```bash
-dsh plugin --profile web add dsh-router-core
+dsh plugin --profile web add https://github.com/DV0RAKIl1/dsh-router-core/releases/download/v0.5.2/dsh-router-core-0.5.2.tgz
 ```
 
-然后**重启 `dsh web`**。打开设置面板,左侧导航「模型」下面会出现 **路由**。
+> 此版本化附件只有在推送 `v0.5.2` 标签且 GitHub Release 工作流成功后才会生成；在此之前，下面的命令尚不可安装。安装前请核对 `SHA256SUMS` 中对应附件的校验值。这里不再使用 `dsh plugin --profile web add dsh-router-core`：当前无作用域 npm 包名会解析到另一个旧项目；本项目也未将 npm 发布配置为安装渠道。
 
-第二处入口是侧栏的**插件**面板:内置的供应商与扩展在那里各占一行「包含的组件」,
-**供应商与扩展的开关也在那一面**(见 [面板](#面板设置--路由)与
-[供应商开关](#供应商开关))。
+安装后请**重启 `dsh web`**，然后打开设置；**Router** 将显示在 Models 下方。
 
-> 更多供应商:DSH 插件形态的供应商各自发 npm 包,同样
-> `dsh plugin --profile web add <包名>` 即可;供应商接入与开发见
-> [`docs/suppliers.md`](docs/suppliers.md)。
+另一个入口是侧栏的**插件**面板：内置供应商和扩展各自在「包含的组件」下显示为一行，也可在此开关（见[面板](#面板设置--路由)和[供应商开关](#供应商开关)）。
+
+> 更多供应商：可安装已发布的 DSH 供应商插件，或将独立 JavaScript 供应商复制到 `<profile>/suppliers/`；见 [`docs/suppliers.md`](docs/suppliers.md)。
 >
-> 本地开发版:不用 npm,直接 `dependencies` 加
-> `"dsh-router-core": "link:/path/to/dsh-router"` 指向本地仓库。
+> 本地开发：使用指向已构建 checkout 的 pnpm `link:` 依赖。GitHub 源码归档不包含生成的 `lib/`，不能直接安装；请使用上面的构建版 Release tarball。
+>
+> tarball 安装的升级/回滚：DSH 不会原地更新 tarball 来源。先移除 `dsh-router-core`，再添加目标版本的不可变 Release 附件 URL。更改版本前请备份 profile 的 `package.json` 和 lockfile。
 
 ## 它解决什么问题
 
@@ -503,8 +502,7 @@ pnpm typecheck
 pnpm test         # node --test "src/**/*.test.ts"
 ```
 
-需要一个供应商最小实现作参考时,看 [`examples/suppliers/echo.js`](examples/suppliers/echo.js);
-完整契约、加载顺序与模型策略见 [`docs/suppliers.md`](docs/suppliers.md)。
+需要一个供应商最小实现作参考时,看 [`examples/suppliers/echo.js`](examples/suppliers/echo.js);原生 DeepSeek Responses/key 管理示例见 [`examples/suppliers/deepseek-responses.js`](examples/suppliers/deepseek-responses.js)。完整契约、加载顺序与模型策略见 [`docs/suppliers.md`](docs/suppliers.md)。
 
 ## 致谢
 

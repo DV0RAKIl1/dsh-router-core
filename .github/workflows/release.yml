@@ -1,0 +1,53 @@
+name: Build and publish GitHub release asset
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.13.0
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Validate source and tests
+        run: |
+          pnpm run check:css
+          node scripts/check-publish.mjs --source
+          pnpm run typecheck
+          pnpm test
+          pnpm run test:examples
+      - name: Build distributable
+        run: pnpm run build
+      - name: Verify package contents
+        run: node scripts/check-publish.mjs --pack
+      - name: Pack and checksum
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          test "$GITHUB_REF_NAME" = "v${version}"
+          expected="dsh-router-core-${version}.tgz"
+          npm pack --ignore-scripts --pack-destination .
+          test -f "$expected"
+          sha256sum "$expected" > SHA256SUMS
+          echo "asset=$expected" >> "$GITHUB_OUTPUT"
+      - name: Create versioned GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" "${{ steps.pack.outputs.asset }}" SHA256SUMS --generate-notes

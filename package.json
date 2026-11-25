@@ -1,6 +1,6 @@
 {
   "name": "dsh-router-core",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "DSH plugin: a simplified 9router (AI routing gateway). Adds a 路由系统 (Routing System) sidebar entry beside 记忆系统; the panel shows suppliers, account pool, combos, and endpoint/API keys.",
   "type": "module",
   "repository": {
@@ -47,7 +47,7 @@
     "./package.json": "./package.json"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13.0"
   },
   "dsh": {
     "bundle": {
@@ -80,6 +80,7 @@
     "src",
     "cordis.patch.yml",
     "docs",
+    "examples",
     "README.md",
     "LICENSE"
   ],
@@ -88,6 +89,7 @@
     "build:client": "DSH_CLIENT_ID=dsh-router-core DSH_CLIENT_FILE=client.js vite build -c client/vite.config.ts && DSH_CLIENT_ID=dsh-external/dsh-router DSH_CLIENT_FILE=client-registry.js vite build -c client/vite.config.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --test \"src/**/*.test.ts\"",
+    "test:examples": "node --test scripts/*.test.mjs",
     "bundle": "tsdown",
     "watch": "tsdown --watch",
     "check:css": "node scripts/check-css.mjs",

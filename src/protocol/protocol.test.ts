@@ -301,7 +301,8 @@ test('responses non-stream JSON finalizes item status to match the terminal resp
       finish,
     ], { model: 'm', stream: false })
     assert.equal(response.status, status)
-    assert.deepEqual(response.output.map((item) => item.status), [itemStatus, itemStatus, itemStatus])
+    assert.ok(Array.isArray(response.output))
+    assert.deepEqual(response.output.map((item: JsonObject) => item.status), [itemStatus, itemStatus, itemStatus])
   }
 })
 
