@@ -52,7 +52,7 @@ tool 消息形态都已按 0.2.0 单面实现)。
 dsh plugin --profile web add https://github.com/DV0RAKIl1/dsh-router-core/releases/download/v0.5.2/dsh-router-core-0.5.2.tgz
 ```
 
-> 此版本化附件只有在推送 `v0.5.2` 标签且 GitHub Release 工作流成功后才会生成；在此之前，下面的命令尚不可安装。安装前请核对 `SHA256SUMS` 中对应附件的校验值。这里不再使用 `dsh plugin --profile web add dsh-router-core`：当前无作用域 npm 包名会解析到另一个旧项目；本项目也未将 npm 发布配置为安装渠道。
+> 此版本化附件已由 `v0.5.2` GitHub Release 工作流生成，可以按上面的命令安装。安装前请下载并核对 `SHA256SUMS` 中对应附件的校验值。这里不再使用 `dsh plugin --profile web add dsh-router-core`：当前无作用域 npm 包名会解析到另一个旧项目；本项目也未将 npm 发布配置为安装渠道。
 
 安装后请**重启 `dsh web`**，然后打开设置；**Router** 将显示在 Models 下方。
 
@@ -499,7 +499,7 @@ Anthropic 的工具调用(非流式 `tool_use` 与流式 `content_block_start` +
 pnpm install
 pnpm build        # lib/index.js(host) + lib/client.js / lib/client-registry.js(browser)
 pnpm typecheck
-pnpm test         # node --test "src/**/*.test.ts"
+pnpm test         # node --experimental-strip-types --test "src/**/*.test.ts"
 ```
 
 需要一个供应商最小实现作参考时,看 [`examples/suppliers/echo.js`](examples/suppliers/echo.js);原生 DeepSeek Responses/key 管理示例见 [`examples/suppliers/deepseek-responses.js`](examples/suppliers/deepseek-responses.js)。完整契约、加载顺序与模型策略见 [`docs/suppliers.md`](docs/suppliers.md)。
