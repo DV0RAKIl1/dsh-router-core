@@ -88,7 +88,7 @@
     "build": "node scripts/check-css.mjs && node scripts/check-publish.mjs --source && rm -rf lib && tsc -p tsconfig.build.json && tsdown && node scripts/copy-row-meta.mjs && npm run build:client && node scripts/check-publish.mjs",
     "build:client": "DSH_CLIENT_ID=dsh-router-core DSH_CLIENT_FILE=client.js vite build -c client/vite.config.ts && DSH_CLIENT_ID=dsh-external/dsh-router DSH_CLIENT_FILE=client-registry.js vite build -c client/vite.config.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --test \"src/**/*.test.ts\"",
+    "test": "node --experimental-strip-types --test \"src/**/*.test.ts\"",
     "test:examples": "node --test scripts/*.test.mjs",
     "bundle": "tsdown",
     "watch": "tsdown --watch",
